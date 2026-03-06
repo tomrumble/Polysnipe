@@ -279,7 +279,16 @@ def main() -> None:
     st.header("PERSISTENCE DIAGNOSTICS")
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(px.histogram(telemetry, x="stability_ratio", nbins=50, title="stability_ratio histogram"), use_container_width=True)
+        stability_histogram = px.histogram(telemetry, x="stability_ratio", nbins=50, title="stability_ratio histogram")
+        stability_histogram.add_vline(
+            x=stability_ratio_threshold,
+            line_color="red",
+            line_width=2,
+            line_dash="dash",
+            annotation_text="threshold",
+            annotation_position="top right",
+        )
+        st.plotly_chart(stability_histogram, use_container_width=True)
         st.plotly_chart(px.histogram(telemetry, x="volatility", nbins=50, title="volatility distribution"), use_container_width=True)
     with c2:
         st.plotly_chart(
