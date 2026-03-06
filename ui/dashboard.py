@@ -17,11 +17,17 @@ from urllib.request import urlopen
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 from src.calibration import build_stability_ratio_calibration
 from src.persistence_model import PersistenceInputs, PersistenceModel
+from src.signal_pipeline import (
+    SignalConfig,
+    SignalInputs,
+    classify_regime,
+    directional_entropy,
+    evaluate_signal,
+)
 
 
 @dataclass
@@ -48,15 +54,17 @@ class ReplaySimulator:
     def __init__(
         self,
         dataset: str,
-        stability_ratio_threshold: float,
         heuristic_guards: Dict[str, bool],
+        signal_config: SignalConfig,
         api_limit: int = 600,
         persistence_mode: str = "model",
+        entropy_window: int = 20,
     ) -> None:
         self.dataset = dataset
-        self.stability_ratio_threshold = stability_ratio_threshold
         self.heuristic_guards = heuristic_guards
+        self.signal_config = signal_config
         self.api_limit = api_limit
+        self.entropy_window = entropy_window
         self.model = PersistenceModel(center=1.0, slope=1.7, mode=persistence_mode)
 
     @classmethod
@@ -129,7 +137,6 @@ class ReplaySimulator:
         }.get(self.dataset, 1.3)
 
         timestamps = pd.date_range(start_time, periods=n, freq="s")
-        path: np.ndarray
 
         if self.dataset in self.API_DATASET_SYMBOLS:
             symbol = self.API_DATASET_SYMBOLS[self.dataset]
@@ -155,8 +162,9 @@ class ReplaySimulator:
 
         stream_balances = np.full(stream_count, total_capital / stream_count)
         equity_points: List[float] = []
+        last_volatility = 0.0
 
-        for i in range(20, n - 1):
+        for i in range(max(self.entropy_window, 20), n - 1):
             current_price = float(path[i])
             boundary_delta = 2.5
             boundary_side = 1.0 if path[i] - path[i - 1] >= 0 else -1.0
@@ -178,31 +186,58 @@ class ReplaySimulator:
                 )
             )
 
-            acceleration = float((path[i] - path[i - 1]) - (path[i - 1] - path[i - 2]))
-            spread = float(abs(rng.normal(0.08 * (1 + out.volatility / 3), 0.03)))
-            distance = float(out.distance_to_boundary)
+            accel = float((path[i] - path[i - 1]) - (path[i - 1] - path[i - 2]))
+            spread = float(abs(rng.normal(0.012 * (1 + out.volatility / 3), 0.004)))
+            entropy_value = float(directional_entropy(path[: i + 1].tolist(), window=self.entropy_window))
+            regime = classify_regime(
+                volatility=out.volatility,
+                directional_entropy_value=entropy_value,
+                price_acceleration=accel,
+                spread=spread,
+                seconds_remaining=seconds_remaining,
+            )
 
-            guard_accel_fail = self.heuristic_guards["acceleration_veto"] and abs(acceleration) > 3.5
+            strict_decision = evaluate_signal(
+                SignalInputs(
+                    seconds_remaining=seconds_remaining,
+                    spread=spread,
+                    directional_entropy=entropy_value,
+                    price_acceleration=accel,
+                    stability_ratio=out.stability_ratio,
+                    volatility_current=out.volatility,
+                    volatility_previous=last_volatility if last_volatility > 0 else out.volatility + 1,
+                ),
+                self.signal_config,
+            )
+
+            guard_accel_fail = self.heuristic_guards["acceleration_veto"] and abs(accel) > 3.5
             guard_spread_fail = self.heuristic_guards["spread_veto"] and spread > 0.22
             guard_vol_fail = self.heuristic_guards["volatility_spike_veto"] and out.volatility > base_vol * 1.8
             guard_osc_fail = self.heuristic_guards["oscillation_veto"] and np.sign(path[i] - path[i - 1]) != np.sign(path[i - 1] - path[i - 2])
-
             heuristic_blocked = guard_accel_fail or guard_spread_fail or guard_vol_fail or guard_osc_fail
-            qualifies = out.stability_ratio >= self.stability_ratio_threshold and not heuristic_blocked
+
+            should_trade = strict_decision.should_trade and not heuristic_blocked
+            veto_reason = strict_decision.veto_reason
+            if not strict_decision.should_trade:
+                veto_reason = strict_decision.veto_reason
+            elif heuristic_blocked:
+                veto_reason = "heuristic_guard"
+
+            signal_reason = strict_decision.signal_reason if should_trade else "none"
 
             future_path = path[i + 1 : expiry_idx + 1]
             max_price_until_expiry = float(np.max(future_path)) if len(future_path) else current_price
             min_price_until_expiry = float(np.min(future_path)) if len(future_path) else current_price
-            expiry_timestamp = timestamps[expiry_idx].isoformat()
+            expiry_iso = timestamps[expiry_idx].isoformat()
 
             hit_boundary = (max_price_until_expiry >= boundary_price) if boundary_side > 0 else (min_price_until_expiry <= boundary_price)
 
             trade_outcome = "NO_TRADE"
             trade_return = 0.0
             failure = 0
+            stream_idx = i % stream_count
 
-            if qualifies:
-                stream_idx = i % stream_count
+            if should_trade:
                 if hit_boundary:
                     trade_outcome = "LOSS"
                     trade_return = -0.01
@@ -212,57 +247,56 @@ class ReplaySimulator:
                     trade_return = 0.01
 
                 stream_balances[stream_idx] *= 1.0 + trade_return
-                trades_rows.append(
-                    {
-                        "timestamp": timestamps[i],
-                        "stream_id": stream_idx,
-                        "stability_ratio": out.stability_ratio,
-                        "persistence_probability": out.persistence_probability,
-                        "seconds_remaining": seconds_remaining,
-                        "boundary_price": boundary_price,
-                        "expiry_timestamp": expiry_timestamp,
-                        "max_price_until_expiry": max_price_until_expiry,
-                        "min_price_until_expiry": min_price_until_expiry,
-                        "return": trade_return,
-                        "trade_outcome": trade_outcome,
-                    }
-                )
 
-            telemetry_rows.append(
-                {
-                    "timestamp": timestamps[i],
-                    "stability_ratio": out.stability_ratio,
-                    "persistence_probability": out.persistence_probability,
-                    "volatility": out.volatility,
-                    "distance_to_boundary": distance,
-                    "seconds_remaining": seconds_remaining,
-                    "boundary_price": boundary_price,
-                    "expiry_timestamp": expiry_timestamp,
-                    "max_price_until_expiry": max_price_until_expiry,
-                    "min_price_until_expiry": min_price_until_expiry,
-                    "acceleration": acceleration,
-                    "spread": spread,
-                    "trade_outcome": trade_outcome,
-                    "failure": failure,
-                    "heuristic_blocked": heuristic_blocked,
-                }
-            )
+            trade_id = f"trade-{i}"
+            row = {
+                "trade_id": trade_id,
+                "timestamp": timestamps[i],
+                "entry_timestamp": timestamps[i].isoformat(),
+                "expiry_timestamp": expiry_iso,
+                "stream_id": stream_idx,
+                "entry_price": current_price,
+                "boundary_price": boundary_price,
+                "distance_to_boundary_at_entry": out.distance_to_boundary,
+                "seconds_remaining": seconds_remaining,
+                "seconds_to_expiry_at_entry": seconds_remaining,
+                "volatility": out.volatility,
+                "volatility_at_entry": out.volatility,
+                "stability_ratio": out.stability_ratio,
+                "stability_ratio_at_entry": out.stability_ratio,
+                "directional_entropy": entropy_value,
+                "entropy_at_entry": entropy_value,
+                "spread": spread,
+                "spread_at_entry": spread,
+                "price_acceleration": accel,
+                "persistence_probability": out.persistence_probability,
+                "regime_label": regime.value,
+                "signal_reason": signal_reason,
+                "veto_reason": veto_reason,
+                "heuristic_blocked": heuristic_blocked,
+                "trade_outcome": trade_outcome,
+                "failure": failure,
+                "return": trade_return,
+                "max_price_until_expiry": max_price_until_expiry,
+                "min_price_until_expiry": min_price_until_expiry,
+                "price_path_until_expiry": json.dumps([float(x) for x in future_path.tolist()]),
+            }
+
+            telemetry_rows.append(row)
+            if should_trade:
+                trades_rows.append(row)
 
             equity_points.append(float(stream_balances.sum()))
+            last_volatility = out.volatility
 
         telemetry = pd.DataFrame(telemetry_rows)
         trades = pd.DataFrame(trades_rows)
-        equity_curve = pd.DataFrame(
-            {
-                "timestamp": telemetry["timestamp"],
-                "equity": equity_points,
-            }
-        )
+        equity_curve = pd.DataFrame({"timestamp": telemetry["timestamp"], "equity": equity_points})
 
         telemetry_path = Path("datasets/telemetry/trade_history.csv")
         telemetry_path.parent.mkdir(parents=True, exist_ok=True)
         telemetry.to_csv(telemetry_path, index=False)
-        build_stability_ratio_calibration([telemetry_path])
+        build_stability_ratio_calibration([telemetry_path], output_path="datasets/calibration/persistence_surface.json")
 
         return SimulationOutputs(telemetry=telemetry, trades=trades, equity_curve=equity_curve)
 
@@ -274,99 +308,48 @@ def _drawdown_series(equity: pd.Series) -> pd.Series:
 
 def _strategy_metrics(trades: pd.DataFrame, equity_curve: pd.DataFrame) -> Dict[str, float]:
     if trades.empty:
-        return {
-            "trade_count": 0,
-            "win_loss_ratio": 0.0,
-            "avg_return": 0.0,
-            "max_drawdown": 0.0,
-        }
+        return {"trade_count": 0, "win_loss_ratio": 0.0, "avg_return": 0.0, "max_drawdown": 0.0}
 
     wins = (trades["trade_outcome"] == "WIN").sum()
     losses = (trades["trade_outcome"] == "LOSS").sum()
-    win_loss_ratio = float(wins / max(losses, 1))
-    avg_return = float(trades["return"].mean())
-    max_drawdown = float(_drawdown_series(equity_curve["equity"]).min())
-
     return {
         "trade_count": int(len(trades)),
-        "win_loss_ratio": win_loss_ratio,
-        "avg_return": avg_return,
-        "max_drawdown": max_drawdown,
+        "win_loss_ratio": float(wins / max(losses, 1)),
+        "avg_return": float(trades["return"].mean()),
+        "max_drawdown": float(_drawdown_series(equity_curve["equity"]).min()),
     }
 
 
-def _failure_rate_by_stability_bucket(telemetry: pd.DataFrame, bin_width: float) -> pd.DataFrame:
-    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
-    if traded.empty:
-        return pd.DataFrame(columns=["bucket_center", "trade_count", "failure_count", "failure_rate"])
-
-    bins = [0.0, 0.5, 1.0, 1.5, 2.0, np.inf]
-    labels = ["0.0-0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", "2.0+"]
-    traded["stability_bucket"] = pd.cut(
-        traded["stability_ratio"], bins=bins, include_lowest=True, right=False, labels=labels
-    )
-
-    grouped = traded.groupby("stability_bucket", observed=False).agg(
-        trade_count=("trade_outcome", "count"),
-        failure_count=("failure", "sum"),
-    )
-    grouped = grouped[grouped["trade_count"] > 0].reset_index()
-    grouped["failure_rate"] = grouped["failure_count"] / grouped["trade_count"]
-    grouped["bucket_center"] = grouped["stability_bucket"].astype(str)
-
-    return grouped[["bucket_center", "trade_count", "failure_count", "failure_rate"]]
+def _bucket_seconds(seconds: float) -> str:
+    if seconds <= 5:
+        return "0-5s"
+    if seconds <= 10:
+        return "5-10s"
+    if seconds <= 20:
+        return "10-20s"
+    if seconds <= 30:
+        return "20-30s"
+    return "30s+"
 
 
-def _failure_rate_by_seconds_remaining(telemetry: pd.DataFrame, second_buckets: list[int]) -> pd.DataFrame:
-    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
-    if traded.empty:
-        return pd.DataFrame(columns=["seconds_remaining_bucket", "trade_count", "failure_rate"])
-
-    traded["seconds_remaining_bucket"] = traded["seconds_remaining"].apply(
-        lambda x: min(second_buckets, key=lambda y: abs(y - x))
-    )
-    grouped = traded.groupby("seconds_remaining_bucket", observed=False).agg(
-        trade_count=("failure", "count"),
-        failure_count=("failure", "sum"),
-    ).reset_index()
-    grouped["failure_rate"] = grouped["failure_count"] / grouped["trade_count"]
-    return grouped
-
-
-def _persistence_surface(telemetry: pd.DataFrame) -> pd.DataFrame:
-    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
-    if traded.empty:
-        return pd.DataFrame(columns=["stability_ratio_bucket", "seconds_remaining_bucket", "failure_rate", "trade_count"])
-
-    stability_bins = [0.0, 0.5, 1.0, 1.5, 2.0, np.inf]
-    stability_labels = ["0.0-0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", "2.0+"]
-    seconds_buckets = [5, 10, 15, 20, 30]
-
-    traded["stability_ratio_bucket"] = pd.cut(
-        traded["stability_ratio"], bins=stability_bins, labels=stability_labels, include_lowest=True, right=False
-    )
-    traded["seconds_remaining_bucket"] = traded["seconds_remaining"].apply(
-        lambda x: f"{min(seconds_buckets, key=lambda y: abs(y - x))}s"
-    )
-
-    grouped = traded.groupby(["stability_ratio_bucket", "seconds_remaining_bucket"], observed=False).agg(
-        trade_count=("failure", "count"),
-        failures=("failure", "sum"),
-    ).reset_index()
-    grouped["failure_rate"] = np.where(grouped["trade_count"] > 0, grouped["failures"] / grouped["trade_count"], np.nan)
-    return grouped
+def _success_vs_feature(traded: pd.DataFrame, feature: str, bins: int = 8) -> pd.DataFrame:
+    frame = traded[[feature, "failure"]].dropna().copy()
+    if frame.empty:
+        return pd.DataFrame(columns=["bucket", "success_rate"])
+    frame["bucket"] = pd.cut(frame[feature], bins=bins, include_lowest=True)
+    grouped = frame.groupby("bucket", observed=False).agg(failure_rate=("failure", "mean")).reset_index()
+    grouped["success_rate"] = 1.0 - grouped["failure_rate"]
+    grouped["bucket"] = grouped["bucket"].astype(str)
+    return grouped[["bucket", "success_rate"]]
 
 
 def main() -> None:
     st.set_page_config(page_title="Trading Simulator Research Dashboard", layout="wide")
     st.title("Trading Simulator Research Dashboard")
-    st.caption("Interactive experimentation for persistence model + replay simulator")
+    st.caption("Late-stage market collapse detector diagnostics")
 
     st.sidebar.header("SIMULATOR CONTROL")
-    dataset = st.sidebar.selectbox(
-        "dataset selector",
-        ["btc_1s_sample", "eth_1s_sample", "macro_high_vol", "btc_binance_api", "eth_binance_api"],
-    )
+    dataset = st.sidebar.selectbox("dataset selector", ["btc_1s_sample", "eth_1s_sample", "macro_high_vol", "btc_binance_api", "eth_binance_api"])
 
     now = datetime.now().replace(microsecond=0)
     start_default = now - timedelta(hours=1)
@@ -379,9 +362,15 @@ def main() -> None:
 
     stream_count = st.sidebar.slider("stream_count", min_value=1, max_value=20, value=4)
     total_capital = st.sidebar.number_input("total_capital", min_value=100.0, value=1000.0, step=100.0)
-    stability_ratio_threshold = st.sidebar.slider("stability_ratio_threshold", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
     persistence_mode = st.sidebar.selectbox("persistence mode", ["model", "empirical"], index=0)
     api_limit = st.sidebar.number_input("binance api candle limit", min_value=24, max_value=1000, value=600, step=1)
+
+    st.sidebar.subheader("state-collapse parameters")
+    stability_ratio_threshold = st.sidebar.slider("stability_ratio_threshold", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
+    entropy_threshold = st.sidebar.slider("entropy_threshold", min_value=0.05, max_value=0.69, value=0.62, step=0.01)
+    accel_threshold = st.sidebar.slider("accel_threshold", min_value=0.05, max_value=2.0, value=0.45, step=0.05)
+    spread_threshold = st.sidebar.slider("spread_threshold", min_value=0.005, max_value=0.05, value=0.02, step=0.001)
+    seconds_threshold = st.sidebar.slider("seconds_remaining_threshold", min_value=5.0, max_value=30.0, value=15.0, step=1.0)
 
     st.sidebar.subheader("heuristic guard toggles")
     heuristics = {
@@ -402,8 +391,14 @@ def main() -> None:
 
         simulator = ReplaySimulator(
             dataset=dataset,
-            stability_ratio_threshold=stability_ratio_threshold,
             heuristic_guards=heuristics,
+            signal_config=SignalConfig(
+                stability_ratio_threshold=stability_ratio_threshold,
+                entropy_threshold=entropy_threshold,
+                accel_threshold=accel_threshold,
+                spread_threshold=spread_threshold,
+                seconds_remaining_threshold=seconds_threshold,
+            ),
             api_limit=int(api_limit),
             persistence_mode=persistence_mode,
         )
@@ -421,137 +416,41 @@ def main() -> None:
 
     telemetry = outputs.telemetry
     trades = outputs.trades
-    equity_curve = outputs.equity_curve
+    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
+    metrics = _strategy_metrics(trades, outputs.equity_curve)
 
-    st.header("PERSISTENCE DIAGNOSTICS")
-    c1, c2 = st.columns(2)
-    with c1:
-        stability_histogram = px.histogram(telemetry, x="stability_ratio", nbins=50, title="stability_ratio histogram")
-        stability_histogram.add_vline(
-            x=stability_ratio_threshold,
-            line_color="red",
-            line_width=2,
-            line_dash="dash",
-            annotation_text="threshold",
-            annotation_position="top right",
-        )
-        st.plotly_chart(stability_histogram, use_container_width=True)
-        st.plotly_chart(px.histogram(telemetry, x="volatility", nbins=50, title="volatility distribution"), use_container_width=True)
-    with c2:
-        st.plotly_chart(
-            px.histogram(telemetry, x="persistence_probability", nbins=50, title="persistence_probability histogram"),
-            use_container_width=True,
-        )
-        st.plotly_chart(px.histogram(telemetry, x="distance_to_boundary", nbins=50, title="distance_to_boundary distribution"), use_container_width=True)
-
-    st.header("STRATEGY RESULTS")
-    metrics = _strategy_metrics(trades, equity_curve)
-
+    st.header("Strategy Results")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("trade count", f"{metrics['trade_count']}")
     m2.metric("win/loss ratio", f"{metrics['win_loss_ratio']:.2f}")
     m3.metric("average return", f"{metrics['avg_return'] * 100:.2f}%")
     m4.metric("max drawdown", f"{metrics['max_drawdown'] * 100:.2f}%")
 
-    e1, e2 = st.columns(2)
-    with e1:
-        st.plotly_chart(px.line(equity_curve, x="timestamp", y="equity", title="equity curve"), use_container_width=True)
-    with e2:
-        dd = equity_curve.copy()
-        dd["drawdown"] = _drawdown_series(dd["equity"])
-        st.plotly_chart(px.area(dd, x="timestamp", y="drawdown", title="drawdown"), use_container_width=True)
+    st.plotly_chart(px.histogram(telemetry, x="seconds_to_expiry_at_entry", nbins=30, title="Trade entry timing histogram"), use_container_width=True)
 
-    st.header("FAILURE ANALYSIS")
-    failure_df = telemetry[
-        [
-            "timestamp",
-            "stability_ratio",
-            "seconds_remaining",
-            "boundary_price",
-            "expiry_timestamp",
-            "max_price_until_expiry",
-            "min_price_until_expiry",
-            "volatility",
-            "distance_to_boundary",
-            "acceleration",
-            "spread",
-            "trade_outcome",
-        ]
-    ].copy()
-    st.dataframe(failure_df, use_container_width=True, height=320)
+    st.plotly_chart(px.bar(telemetry["signal_reason"].value_counts().reset_index(), x="signal_reason", y="count", title="Signal reason distribution"), use_container_width=True)
 
-    st.header("Empirical failure rate vs stability_ratio")
-    bucket_df = _failure_rate_by_stability_bucket(telemetry, bin_width=0.5)
+    if not traded.empty:
+        regime_matrix = traded.groupby(["regime_label", "trade_outcome"]).size().reset_index(name="count")
+        st.plotly_chart(px.density_heatmap(regime_matrix, x="trade_outcome", y="regime_label", z="count", title="Regime success matrix"), use_container_width=True)
 
-    if bucket_df.empty:
-        st.warning("No executed trades for current parameters. Lower threshold or disable guard vetoes.")
-    else:
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=bucket_df["bucket_center"],
-                y=bucket_df["failure_rate"],
-                mode="lines+markers",
-                name="empirical_failure_rate",
-                yaxis="y1",
-            )
-        )
-        fig.add_trace(
-            go.Bar(
-                x=bucket_df["bucket_center"],
-                y=bucket_df["trade_count"],
-                name="trade_count",
-                yaxis="y2",
-                opacity=0.35,
-            )
-        )
+        heat = traded.copy()
+        heat["vol_bucket"] = pd.cut(heat["volatility"], bins=8)
+        heat["ent_bucket"] = pd.cut(heat["directional_entropy"], bins=8)
+        failure_heat = heat.groupby(["vol_bucket", "ent_bucket"], observed=False).agg(failure_rate=("failure", "mean")).reset_index()
+        failure_heat["vol_bucket"] = failure_heat["vol_bucket"].astype(str)
+        failure_heat["ent_bucket"] = failure_heat["ent_bucket"].astype(str)
+        st.plotly_chart(px.density_heatmap(failure_heat, x="ent_bucket", y="vol_bucket", z="failure_rate", title="Failure heatmap (volatility vs entropy)"), use_container_width=True)
 
-        fig.update_layout(
-            xaxis_title="stability_ratio_bucket",
-            yaxis=dict(title="empirical_failure_rate", rangemode="tozero"),
-            yaxis2=dict(title="trade_count", overlaying="y", side="right", rangemode="tozero"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(bucket_df, use_container_width=True, height=220)
+        sec_diag = traded.groupby(traded["seconds_remaining"].apply(_bucket_seconds), observed=False).agg(failure_rate=("failure", "mean")).reset_index(names="seconds_bucket")
+        st.plotly_chart(px.bar(sec_diag, x="seconds_bucket", y="failure_rate", title="Failure rate vs seconds_remaining"), use_container_width=True)
 
-    st.header("Empirical failure rate vs seconds_remaining")
-    seconds_df = _failure_rate_by_seconds_remaining(telemetry, second_buckets=[5, 10, 15, 20, 30])
-    if seconds_df.empty:
-        st.warning("No executed trades for current parameters.")
-    else:
-        st.plotly_chart(
-            px.bar(
-                seconds_df,
-                x="seconds_remaining_bucket",
-                y="failure_rate",
-                title="Empirical failure rate by seconds remaining bucket",
-                labels={"seconds_remaining_bucket": "seconds_remaining_bucket", "failure_rate": "failure_rate"},
-            ),
-            use_container_width=True,
-        )
-        st.dataframe(seconds_df, use_container_width=True, height=220)
+        for feature in ["directional_entropy", "volatility", "spread"]:
+            chart_df = _success_vs_feature(traded, feature)
+            st.plotly_chart(px.line(chart_df, x="bucket", y="success_rate", title=f"{feature} vs success_rate"), use_container_width=True)
 
-    st.header("PERSISTENCE SURFACE")
-    surface_df = _persistence_surface(telemetry)
-    if surface_df.empty:
-        st.warning("No executed trades for persistence surface.")
-    else:
-        heatmap_df = surface_df.pivot(index="stability_ratio_bucket", columns="seconds_remaining_bucket", values="failure_rate")
-        count_df = surface_df.pivot(index="stability_ratio_bucket", columns="seconds_remaining_bucket", values="trade_count")
-        heatmap_fig = px.imshow(
-            heatmap_df,
-            aspect="auto",
-            color_continuous_scale="RdYlGn_r",
-            labels={"x": "seconds_remaining_bucket", "y": "stability_ratio_bucket", "color": "failure_rate"},
-            title="Empirical persistence surface (failure rate)",
-        )
-        heatmap_fig.update_traces(
-            customdata=np.expand_dims(count_df.to_numpy(), axis=-1),
-            hovertemplate="stability=%{y}<br>seconds=%{x}<br>failure_rate=%{z:.3f}<br>trade_count=%{customdata[0]:.0f}<extra></extra>",
-        )
-        st.plotly_chart(heatmap_fig, use_container_width=True)
-        st.dataframe(surface_df, use_container_width=True, height=260)
+    st.header("Trade Telemetry")
+    st.dataframe(telemetry, use_container_width=True, height=340)
 
 
 if __name__ == "__main__":
