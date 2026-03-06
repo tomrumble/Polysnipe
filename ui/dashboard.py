@@ -20,6 +20,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.calibration import build_stability_ratio_calibration
 from src.persistence_model import PersistenceInputs, PersistenceModel
 
 
@@ -31,11 +32,7 @@ class SimulationOutputs:
 
 
 class ReplaySimulator:
-    """Lightweight replay simulator for research experimentation.
-
-    This simulator generates deterministic pseudo-market trajectories per dataset
-    and evaluates the persistence model at each step.
-    """
+    """Lightweight replay simulator for research experimentation."""
 
     DATASET_SEEDS: Dict[str, int] = {
         "btc_1s_sample": 17,
@@ -54,12 +51,13 @@ class ReplaySimulator:
         stability_ratio_threshold: float,
         heuristic_guards: Dict[str, bool],
         api_limit: int = 600,
+        persistence_mode: str = "model",
     ) -> None:
         self.dataset = dataset
         self.stability_ratio_threshold = stability_ratio_threshold
         self.heuristic_guards = heuristic_guards
         self.api_limit = api_limit
-        self.model = PersistenceModel(center=1.0, slope=1.7)
+        self.model = PersistenceModel(center=1.0, slope=1.7, mode=persistence_mode)
 
     @classmethod
     def _cache_path(cls, symbol: str, limit: int) -> Path:
@@ -158,15 +156,17 @@ class ReplaySimulator:
         stream_balances = np.full(stream_count, total_capital / stream_count)
         equity_points: List[float] = []
 
-        for i in range(20, n - 3):
+        for i in range(20, n - 1):
             current_price = float(path[i])
             boundary_delta = 2.5
             boundary_side = 1.0 if path[i] - path[i - 1] >= 0 else -1.0
             boundary_price = current_price + boundary_side * boundary_delta
             recent_prices = path[i - 20 : i + 1].tolist()
 
+            expiry_idx = min(i + 30, n - 1)
+            seconds_remaining = float((timestamps[expiry_idx] - timestamps[i]).total_seconds())
             now_ts = timestamps[i].timestamp()
-            expiry_ts = (timestamps[i] + timedelta(seconds=30)).timestamp()
+            expiry_ts = timestamps[expiry_idx].timestamp()
 
             out = self.model.compute(
                 PersistenceInputs(
@@ -190,15 +190,20 @@ class ReplaySimulator:
             heuristic_blocked = guard_accel_fail or guard_spread_fail or guard_vol_fail or guard_osc_fail
             qualifies = out.stability_ratio >= self.stability_ratio_threshold and not heuristic_blocked
 
+            future_path = path[i + 1 : expiry_idx + 1]
+            max_price_until_expiry = float(np.max(future_path)) if len(future_path) else current_price
+            min_price_until_expiry = float(np.min(future_path)) if len(future_path) else current_price
+            expiry_timestamp = timestamps[expiry_idx].isoformat()
+
+            hit_boundary = (max_price_until_expiry >= boundary_price) if boundary_side > 0 else (min_price_until_expiry <= boundary_price)
+
             trade_outcome = "NO_TRADE"
             trade_return = 0.0
             failure = 0
 
             if qualifies:
                 stream_idx = i % stream_count
-                failure_prob = float(1.0 - out.persistence_probability)
-                failed = rng.random() < failure_prob
-                if failed:
+                if hit_boundary:
                     trade_outcome = "LOSS"
                     trade_return = -0.01
                     failure = 1
@@ -213,6 +218,11 @@ class ReplaySimulator:
                         "stream_id": stream_idx,
                         "stability_ratio": out.stability_ratio,
                         "persistence_probability": out.persistence_probability,
+                        "seconds_remaining": seconds_remaining,
+                        "boundary_price": boundary_price,
+                        "expiry_timestamp": expiry_timestamp,
+                        "max_price_until_expiry": max_price_until_expiry,
+                        "min_price_until_expiry": min_price_until_expiry,
                         "return": trade_return,
                         "trade_outcome": trade_outcome,
                     }
@@ -225,6 +235,11 @@ class ReplaySimulator:
                     "persistence_probability": out.persistence_probability,
                     "volatility": out.volatility,
                     "distance_to_boundary": distance,
+                    "seconds_remaining": seconds_remaining,
+                    "boundary_price": boundary_price,
+                    "expiry_timestamp": expiry_timestamp,
+                    "max_price_until_expiry": max_price_until_expiry,
+                    "min_price_until_expiry": min_price_until_expiry,
                     "acceleration": acceleration,
                     "spread": spread,
                     "trade_outcome": trade_outcome,
@@ -243,6 +258,11 @@ class ReplaySimulator:
                 "equity": equity_points,
             }
         )
+
+        telemetry_path = Path("datasets/telemetry/trade_history.csv")
+        telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+        telemetry.to_csv(telemetry_path, index=False)
+        build_stability_ratio_calibration([telemetry_path])
 
         return SimulationOutputs(telemetry=telemetry, trades=trades, equity_curve=equity_curve)
 
@@ -280,11 +300,11 @@ def _failure_rate_by_stability_bucket(telemetry: pd.DataFrame, bin_width: float)
     if traded.empty:
         return pd.DataFrame(columns=["bucket_center", "trade_count", "failure_count", "failure_rate"])
 
-    min_val = np.floor(traded["stability_ratio"].min() / bin_width) * bin_width
-    max_val = np.ceil(traded["stability_ratio"].max() / bin_width) * bin_width + bin_width
-    bins = np.arange(min_val, max_val + bin_width, bin_width)
-
-    traded["stability_bucket"] = pd.cut(traded["stability_ratio"], bins=bins, include_lowest=True)
+    bins = [0.0, 0.5, 1.0, 1.5, 2.0, np.inf]
+    labels = ["0.0-0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", "2.0+"]
+    traded["stability_bucket"] = pd.cut(
+        traded["stability_ratio"], bins=bins, include_lowest=True, right=False, labels=labels
+    )
 
     grouped = traded.groupby("stability_bucket", observed=False).agg(
         trade_count=("trade_outcome", "count"),
@@ -292,9 +312,49 @@ def _failure_rate_by_stability_bucket(telemetry: pd.DataFrame, bin_width: float)
     )
     grouped = grouped[grouped["trade_count"] > 0].reset_index()
     grouped["failure_rate"] = grouped["failure_count"] / grouped["trade_count"]
-    grouped["bucket_center"] = grouped["stability_bucket"].apply(lambda x: x.mid)
+    grouped["bucket_center"] = grouped["stability_bucket"].astype(str)
 
     return grouped[["bucket_center", "trade_count", "failure_count", "failure_rate"]]
+
+
+def _failure_rate_by_seconds_remaining(telemetry: pd.DataFrame, second_buckets: list[int]) -> pd.DataFrame:
+    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
+    if traded.empty:
+        return pd.DataFrame(columns=["seconds_remaining_bucket", "trade_count", "failure_rate"])
+
+    traded["seconds_remaining_bucket"] = traded["seconds_remaining"].apply(
+        lambda x: min(second_buckets, key=lambda y: abs(y - x))
+    )
+    grouped = traded.groupby("seconds_remaining_bucket", observed=False).agg(
+        trade_count=("failure", "count"),
+        failure_count=("failure", "sum"),
+    ).reset_index()
+    grouped["failure_rate"] = grouped["failure_count"] / grouped["trade_count"]
+    return grouped
+
+
+def _persistence_surface(telemetry: pd.DataFrame) -> pd.DataFrame:
+    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
+    if traded.empty:
+        return pd.DataFrame(columns=["stability_ratio_bucket", "seconds_remaining_bucket", "failure_rate", "trade_count"])
+
+    stability_bins = [0.0, 0.5, 1.0, 1.5, 2.0, np.inf]
+    stability_labels = ["0.0-0.5", "0.5-1.0", "1.0-1.5", "1.5-2.0", "2.0+"]
+    seconds_buckets = [5, 10, 15, 20, 30]
+
+    traded["stability_ratio_bucket"] = pd.cut(
+        traded["stability_ratio"], bins=stability_bins, labels=stability_labels, include_lowest=True, right=False
+    )
+    traded["seconds_remaining_bucket"] = traded["seconds_remaining"].apply(
+        lambda x: f"{min(seconds_buckets, key=lambda y: abs(y - x))}s"
+    )
+
+    grouped = traded.groupby(["stability_ratio_bucket", "seconds_remaining_bucket"], observed=False).agg(
+        trade_count=("failure", "count"),
+        failures=("failure", "sum"),
+    ).reset_index()
+    grouped["failure_rate"] = np.where(grouped["trade_count"] > 0, grouped["failures"] / grouped["trade_count"], np.nan)
+    return grouped
 
 
 def main() -> None:
@@ -312,11 +372,15 @@ def main() -> None:
     start_default = now - timedelta(hours=1)
     end_default = now
 
-    start_time = st.sidebar.text_input("start time (YYYY-MM-DD HH:MM:SS)", value=start_default.strftime("%Y-%m-%d %H:%M:%S"))
-    end_time = st.sidebar.text_input("end time (YYYY-MM-DD HH:MM:SS)", value=end_default.strftime("%Y-%m-%d %H:%M:%S"))
+    start_date = st.sidebar.date_input("start date", value=start_default.date())
+    start_clock = st.sidebar.time_input("start time", value=start_default.time())
+    end_date = st.sidebar.date_input("end date", value=end_default.date())
+    end_clock = st.sidebar.time_input("end time", value=end_default.time())
+
     stream_count = st.sidebar.slider("stream_count", min_value=1, max_value=20, value=4)
     total_capital = st.sidebar.number_input("total_capital", min_value=100.0, value=1000.0, step=100.0)
     stability_ratio_threshold = st.sidebar.slider("stability_ratio_threshold", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
+    persistence_mode = st.sidebar.selectbox("persistence mode", ["model", "empirical"], index=0)
     api_limit = st.sidebar.number_input("binance api candle limit", min_value=24, max_value=1000, value=600, step=1)
 
     st.sidebar.subheader("heuristic guard toggles")
@@ -333,18 +397,15 @@ def main() -> None:
         st.session_state["sim_outputs"] = None
 
     if run_clicked:
-        try:
-            start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
-            end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            st.error("Invalid datetime format. Use YYYY-MM-DD HH:MM:SS.")
-            return
+        start_dt = datetime.combine(start_date, start_clock)
+        end_dt = datetime.combine(end_date, end_clock)
 
         simulator = ReplaySimulator(
             dataset=dataset,
             stability_ratio_threshold=stability_ratio_threshold,
             heuristic_guards=heuristics,
             api_limit=int(api_limit),
+            persistence_mode=persistence_mode,
         )
         st.session_state["sim_outputs"] = simulator.run(
             start_time=start_dt,
@@ -405,6 +466,11 @@ def main() -> None:
         [
             "timestamp",
             "stability_ratio",
+            "seconds_remaining",
+            "boundary_price",
+            "expiry_timestamp",
+            "max_price_until_expiry",
+            "min_price_until_expiry",
             "volatility",
             "distance_to_boundary",
             "acceleration",
@@ -414,9 +480,8 @@ def main() -> None:
     ].copy()
     st.dataframe(failure_df, use_container_width=True, height=320)
 
-    st.header("Empirical Failure Rate vs Stability Ratio")
-    bin_width = st.slider("stability ratio bin width", min_value=0.1, max_value=1.0, step=0.1, value=0.5)
-    bucket_df = _failure_rate_by_stability_bucket(telemetry, bin_width=bin_width)
+    st.header("Empirical failure rate vs stability_ratio")
+    bucket_df = _failure_rate_by_stability_bucket(telemetry, bin_width=0.5)
 
     if bucket_df.empty:
         st.warning("No executed trades for current parameters. Lower threshold or disable guard vetoes.")
@@ -442,13 +507,51 @@ def main() -> None:
         )
 
         fig.update_layout(
-            xaxis_title="stability_ratio_bucket_center",
+            xaxis_title="stability_ratio_bucket",
             yaxis=dict(title="empirical_failure_rate", rangemode="tozero"),
             yaxis2=dict(title="trade_count", overlaying="y", side="right", rangemode="tozero"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
         )
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(bucket_df, use_container_width=True, height=220)
+
+    st.header("Empirical failure rate vs seconds_remaining")
+    seconds_df = _failure_rate_by_seconds_remaining(telemetry, second_buckets=[5, 10, 15, 20, 30])
+    if seconds_df.empty:
+        st.warning("No executed trades for current parameters.")
+    else:
+        st.plotly_chart(
+            px.bar(
+                seconds_df,
+                x="seconds_remaining_bucket",
+                y="failure_rate",
+                title="Empirical failure rate by seconds remaining bucket",
+                labels={"seconds_remaining_bucket": "seconds_remaining_bucket", "failure_rate": "failure_rate"},
+            ),
+            use_container_width=True,
+        )
+        st.dataframe(seconds_df, use_container_width=True, height=220)
+
+    st.header("PERSISTENCE SURFACE")
+    surface_df = _persistence_surface(telemetry)
+    if surface_df.empty:
+        st.warning("No executed trades for persistence surface.")
+    else:
+        heatmap_df = surface_df.pivot(index="stability_ratio_bucket", columns="seconds_remaining_bucket", values="failure_rate")
+        count_df = surface_df.pivot(index="stability_ratio_bucket", columns="seconds_remaining_bucket", values="trade_count")
+        heatmap_fig = px.imshow(
+            heatmap_df,
+            aspect="auto",
+            color_continuous_scale="RdYlGn_r",
+            labels={"x": "seconds_remaining_bucket", "y": "stability_ratio_bucket", "color": "failure_rate"},
+            title="Empirical persistence surface (failure rate)",
+        )
+        heatmap_fig.update_traces(
+            customdata=np.expand_dims(count_df.to_numpy(), axis=-1),
+            hovertemplate="stability=%{y}<br>seconds=%{x}<br>failure_rate=%{z:.3f}<br>trade_count=%{customdata[0]:.0f}<extra></extra>",
+        )
+        st.plotly_chart(heatmap_fig, use_container_width=True)
+        st.dataframe(surface_df, use_container_width=True, height=260)
 
 
 if __name__ == "__main__":
