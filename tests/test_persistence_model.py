@@ -46,3 +46,19 @@ def test_volatility_uses_epsilon_for_insufficient_data():
 
     assert model.compute_volatility([]) == 1e-6
     assert model.compute_volatility([100.0]) == 1e-6
+
+
+def test_stability_ratio_respects_remaining_move_floor():
+    model = PersistenceModel(min_remaining_move=0.01, max_stability_ratio=1000.0)
+
+    ratio = model.compute_stability_ratio(distance_to_boundary=2.0, volatility=1e-9, time_remaining=1.0)
+
+    assert ratio == 200.0
+
+
+def test_stability_ratio_is_capped_at_configured_maximum():
+    model = PersistenceModel(min_remaining_move=0.01, max_stability_ratio=10.0)
+
+    ratio = model.compute_stability_ratio(distance_to_boundary=20.0, volatility=1e-9, time_remaining=1.0)
+
+    assert ratio == 10.0

@@ -160,7 +160,9 @@ class ReplaySimulator:
 
         for i in range(20, n - 3):
             current_price = float(path[i])
-            boundary_price = current_price + rng.normal(2.5, 1.2)
+            boundary_delta = 2.5
+            boundary_side = 1.0 if path[i] - path[i - 1] >= 0 else -1.0
+            boundary_price = current_price + boundary_side * boundary_delta
             recent_prices = path[i - 20 : i + 1].tolist()
 
             now_ts = timestamps[i].timestamp()

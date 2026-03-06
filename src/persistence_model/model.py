@@ -63,7 +63,14 @@ class PersistenceModel:
     - ``slope`` controls how quickly confidence transitions around ``center``
     """
 
-    def __init__(self, center: float = 1.0, slope: float = 1.5, epsilon: float = 1e-9) -> None:
+    def __init__(
+        self,
+        center: float = 1.0,
+        slope: float = 1.5,
+        epsilon: float = 1e-9,
+        min_remaining_move: float = 0.01,
+        max_stability_ratio: float = 10.0,
+    ) -> None:
         """Initialize model calibration parameters.
 
         Args:
@@ -71,15 +78,25 @@ class PersistenceModel:
                 persistence probability.
             slope: Steepness of logistic mapping.
             epsilon: Small positive floor used for numerical stability.
+            min_remaining_move: Floor for volatility * sqrt(time_remaining)
+                to prevent denominator collapse.
+            max_stability_ratio: Upper cap for stability ratio before logistic
+                mapping to keep extreme tails from dominating outputs.
         """
 
         if slope <= 0:
             raise ValueError("slope must be > 0")
         if epsilon <= 0:
             raise ValueError("epsilon must be > 0")
+        if min_remaining_move <= 0:
+            raise ValueError("min_remaining_move must be > 0")
+        if max_stability_ratio <= 0:
+            raise ValueError("max_stability_ratio must be > 0")
         self._center = center
         self._slope = slope
         self._epsilon = epsilon
+        self._min_remaining_move = min_remaining_move
+        self._max_stability_ratio = max_stability_ratio
 
     def compute(self, inputs: PersistenceInputs) -> PersistenceOutput:
         """Compute persistence metrics and probability from raw inputs."""
@@ -144,8 +161,10 @@ class PersistenceModel:
         if time_remaining <= 0:
             return 0.0
 
-        denom = max(volatility, self._epsilon) * sqrt(time_remaining)
-        return distance_to_boundary / max(denom, self._epsilon)
+        remaining_move = max(volatility, self._epsilon) * sqrt(time_remaining)
+        denom = max(remaining_move, self._min_remaining_move, self._epsilon)
+        stability_ratio = distance_to_boundary / denom
+        return min(stability_ratio, self._max_stability_ratio)
 
     def map_stability_ratio_to_probability(self, stability_ratio: float) -> float:
         """Map stability ratio to persistence probability via logistic curve.
