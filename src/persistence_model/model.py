@@ -12,10 +12,12 @@ reach the boundary before expiry, so persistence probability should be higher.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from math import exp, sqrt
+from pathlib import Path
 from statistics import fmean, pstdev
-from typing import Sequence
+from typing import Any, Sequence
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,9 @@ class PersistenceModel:
         epsilon: float = 1e-9,
         min_remaining_move: float = 0.01,
         max_stability_ratio: float = 10.0,
+        mode: str = "model",
+        calibration_path: str | Path = "datasets/calibration/stability_ratio_calibration.json",
+        min_empirical_samples: int = 30,
     ) -> None:
         """Initialize model calibration parameters.
 
@@ -82,6 +87,10 @@ class PersistenceModel:
                 to prevent denominator collapse.
             max_stability_ratio: Upper cap for stability ratio before logistic
                 mapping to keep extreme tails from dominating outputs.
+            mode: Probability mode, either ``model`` or ``empirical``.
+            calibration_path: Path to empirical stability-ratio calibration.
+            min_empirical_samples: Minimum observations in a calibration bucket
+                for empirical probabilities to be used.
         """
 
         if slope <= 0:
@@ -92,20 +101,44 @@ class PersistenceModel:
             raise ValueError("min_remaining_move must be > 0")
         if max_stability_ratio <= 0:
             raise ValueError("max_stability_ratio must be > 0")
+        if mode not in {"model", "empirical"}:
+            raise ValueError("mode must be 'model' or 'empirical'")
+        if min_empirical_samples <= 0:
+            raise ValueError("min_empirical_samples must be > 0")
+
         self._center = center
         self._slope = slope
         self._epsilon = epsilon
         self._min_remaining_move = min_remaining_move
         self._max_stability_ratio = max_stability_ratio
+        self._mode = mode
+        self._calibration_path = Path(calibration_path)
+        self._min_empirical_samples = min_empirical_samples
+        self._calibration_buckets = self._load_empirical_calibration()
 
     def compute(self, inputs: PersistenceInputs) -> PersistenceOutput:
-        """Compute persistence metrics and probability from raw inputs."""
+        """Compute persistence metrics and probability from raw inputs.
+
+        Final model probability uses a first-passage diffusion approximation:
+
+            barrier_risk = exp(-(distance^2)/(2 * volatility^2 * time_remaining))
+            adjusted_probability = logistic_probability * (1 - barrier_risk)
+
+        If the model runs in empirical mode and a matching calibration bucket has
+        enough samples, the empirical probability is used instead.
+        """
 
         volatility = self.compute_volatility(inputs.recent_prices)
         distance = self.compute_distance_to_boundary(inputs.current_price, inputs.boundary_price)
         time_remaining = self.compute_time_remaining(inputs.now_timestamp, inputs.expiry_timestamp)
         stability_ratio = self.compute_stability_ratio(distance, volatility, time_remaining)
-        persistence_probability = self.map_stability_ratio_to_probability(stability_ratio)
+
+        logistic_probability = self.map_stability_ratio_to_probability(stability_ratio)
+        barrier_risk = self.compute_barrier_hitting_risk(distance, volatility, time_remaining)
+        model_probability = logistic_probability * (1.0 - barrier_risk)
+
+        empirical_probability = self._lookup_empirical_probability(stability_ratio)
+        persistence_probability = empirical_probability if empirical_probability is not None else model_probability
 
         return PersistenceOutput(
             volatility=volatility,
@@ -166,6 +199,15 @@ class PersistenceModel:
         stability_ratio = distance_to_boundary / denom
         return min(stability_ratio, self._max_stability_ratio)
 
+    def compute_barrier_hitting_risk(self, distance_to_boundary: float, volatility: float, time_remaining: float) -> float:
+        """First-passage diffusion approximation for barrier hitting risk."""
+
+        epsilon = max(self._epsilon, 1e-6)
+        safe_time = max(time_remaining, epsilon)
+        safe_vol = max(volatility, epsilon)
+        exponent = -((distance_to_boundary**2) / (2.0 * (safe_vol**2) * safe_time))
+        return min(max(exp(exponent), 0.0), 1.0)
+
     def map_stability_ratio_to_probability(self, stability_ratio: float) -> float:
         """Map stability ratio to persistence probability via logistic curve.
 
@@ -188,3 +230,57 @@ class PersistenceModel:
 
         self._center = fmean(stability_ratio_samples)
         return self._center
+
+    def _load_empirical_calibration(self) -> list[dict[str, Any]]:
+        if not self._calibration_path.exists():
+            return []
+
+        try:
+            payload = json.loads(self._calibration_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+
+        if not isinstance(payload, dict):
+            return []
+
+        # Backward compatibility: accept either {"buckets": [...]} or
+        # threshold-keyed dict format such as {"0.5": {...}, "1.0": {...}}.
+        if "buckets" in payload and isinstance(payload.get("buckets"), list):
+            buckets = payload.get("buckets", [])
+            return [b for b in buckets if isinstance(b, dict)]
+
+        buckets: list[dict[str, Any]] = []
+        for label, bucket in payload.items():
+            if not isinstance(bucket, dict):
+                continue
+            normalized = dict(bucket)
+            normalized["label"] = label
+            if "lower" not in normalized:
+                try:
+                    normalized["lower"] = float(label.rstrip("+"))
+                except ValueError:
+                    continue
+            buckets.append(normalized)
+
+        return buckets
+
+    def _lookup_empirical_probability(self, stability_ratio: float) -> float | None:
+        if self._mode != "empirical" or not self._calibration_buckets:
+            return None
+
+        for bucket in self._calibration_buckets:
+            lower = bucket.get("lower")
+            upper = bucket.get("upper")
+            trade_count = bucket.get("trade_count", 0)
+            empirical_persistence = bucket.get("empirical_persistence")
+
+            if trade_count < self._min_empirical_samples:
+                continue
+            if lower is None or empirical_persistence is None:
+                continue
+            if upper is None and stability_ratio >= float(lower):
+                return float(empirical_persistence)
+            if upper is not None and float(lower) <= stability_ratio < float(upper):
+                return float(empirical_persistence)
+
+        return None

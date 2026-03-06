@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 
@@ -62,3 +63,34 @@ def test_stability_ratio_is_capped_at_configured_maximum():
     ratio = model.compute_stability_ratio(distance_to_boundary=20.0, volatility=1e-9, time_remaining=1.0)
 
     assert ratio == 10.0
+
+
+def test_barrier_risk_reduces_probability():
+    model = PersistenceModel(center=1.0, slope=2.0)
+
+    ratio = 1.5
+    logistic = model.map_stability_ratio_to_probability(ratio)
+    risk = model.compute_barrier_hitting_risk(distance_to_boundary=1.0, volatility=0.5, time_remaining=10.0)
+
+    assert 0.0 < risk < 1.0
+    assert logistic * (1.0 - risk) < logistic
+
+
+def test_empirical_mode_uses_calibration_bucket(tmp_path):
+    calibration = {
+        "1.0": {
+            "lower": 1.0,
+            "upper": 1.5,
+            "trade_count": 50,
+            "failure_count": 5,
+            "failure_rate": 0.1,
+            "empirical_persistence": 0.9,
+        }
+    }
+    calibration_path = tmp_path / "stability_ratio_calibration.json"
+    calibration_path.write_text(json.dumps(calibration))
+
+    model = PersistenceModel(mode="empirical", calibration_path=calibration_path)
+    probability = model._lookup_empirical_probability(1.2)
+
+    assert probability == 0.9
