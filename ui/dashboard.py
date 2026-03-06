@@ -6,9 +6,13 @@ Run with:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
@@ -38,12 +42,69 @@ class ReplaySimulator:
         "eth_1s_sample": 43,
         "macro_high_vol": 99,
     }
+    API_DATASET_SYMBOLS: Dict[str, str] = {
+        "btc_binance_api": "BTCUSDT",
+        "eth_binance_api": "ETHUSDT",
+    }
+    CACHE_DIR = Path("datasets/cache")
 
-    def __init__(self, dataset: str, stability_ratio_threshold: float, heuristic_guards: Dict[str, bool]) -> None:
+    def __init__(
+        self,
+        dataset: str,
+        stability_ratio_threshold: float,
+        heuristic_guards: Dict[str, bool],
+        api_limit: int = 600,
+    ) -> None:
         self.dataset = dataset
         self.stability_ratio_threshold = stability_ratio_threshold
         self.heuristic_guards = heuristic_guards
+        self.api_limit = api_limit
         self.model = PersistenceModel(center=1.0, slope=1.7)
+
+    @classmethod
+    def _cache_path(cls, symbol: str, limit: int) -> Path:
+        return cls.CACHE_DIR / f"{symbol.lower()}_1s_{limit}.csv"
+
+    @classmethod
+    def _load_cached_binance_prices(cls, symbol: str, limit: int) -> pd.DataFrame:
+        cache_path = cls._cache_path(symbol, limit)
+        if not cache_path.exists():
+            return pd.DataFrame(columns=["timestamp", "price"])
+
+        cached = pd.read_csv(cache_path)
+        if cached.empty:
+            return pd.DataFrame(columns=["timestamp", "price"])
+
+        cached["timestamp"] = pd.to_datetime(cached["timestamp"])
+        return cached[["timestamp", "price"]]
+
+    @classmethod
+    def _fetch_binance_prices(cls, symbol: str, limit: int) -> pd.DataFrame:
+        cached = cls._load_cached_binance_prices(symbol=symbol, limit=limit)
+        if not cached.empty:
+            return cached
+
+        query = urlencode({"symbol": symbol, "interval": "1s", "limit": limit})
+        url = f"https://api.binance.com/api/v3/klines?{query}"
+
+        with urlopen(url, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        rows = [
+            {
+                "timestamp": datetime.fromtimestamp(float(row[0]) / 1000),
+                "price": float(row[4]),
+            }
+            for row in payload
+        ]
+        frame = pd.DataFrame(rows, columns=["timestamp", "price"])
+
+        if frame.empty:
+            return frame
+
+        cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(cls._cache_path(symbol=symbol, limit=limit), index=False)
+        return frame
 
     def run(
         self,
@@ -61,17 +122,35 @@ class ReplaySimulator:
         seed = self.DATASET_SEEDS.get(self.dataset, 7) + stream_count
         rng = np.random.default_rng(seed)
 
-        timestamps = pd.date_range(start_time, periods=n, freq="s")
-
         base_vol = {
             "btc_1s_sample": 1.2,
+            "btc_binance_api": 1.2,
             "eth_1s_sample": 1.7,
+            "eth_binance_api": 1.7,
             "macro_high_vol": 2.6,
         }.get(self.dataset, 1.3)
 
-        noise = rng.normal(0, base_vol, n)
-        drift = rng.normal(0.01, 0.05, n).cumsum() / 12
-        path = 100 + np.cumsum(noise + drift)
+        timestamps = pd.date_range(start_time, periods=n, freq="s")
+        path: np.ndarray
+
+        if self.dataset in self.API_DATASET_SYMBOLS:
+            symbol = self.API_DATASET_SYMBOLS[self.dataset]
+            try:
+                frame = self._fetch_binance_prices(symbol=symbol, limit=min(self.api_limit, 1000))
+                if len(frame) >= 24:
+                    timestamps = pd.to_datetime(frame["timestamp"])
+                    path = frame["price"].to_numpy(dtype=float)
+                    n = len(path)
+                else:
+                    raise ValueError("Binance returned insufficient candles for simulation")
+            except Exception:
+                noise = rng.normal(0, base_vol, n)
+                drift = rng.normal(0.01, 0.05, n).cumsum() / 12
+                path = 100 + np.cumsum(noise + drift)
+        else:
+            noise = rng.normal(0, base_vol, n)
+            drift = rng.normal(0.01, 0.05, n).cumsum() / 12
+            path = 100 + np.cumsum(noise + drift)
 
         telemetry_rows: List[Dict[str, float | int | str]] = []
         trades_rows: List[Dict[str, float | int | str]] = []
@@ -222,7 +301,10 @@ def main() -> None:
     st.caption("Interactive experimentation for persistence model + replay simulator")
 
     st.sidebar.header("SIMULATOR CONTROL")
-    dataset = st.sidebar.selectbox("dataset selector", ["btc_1s_sample", "eth_1s_sample", "macro_high_vol"])
+    dataset = st.sidebar.selectbox(
+        "dataset selector",
+        ["btc_1s_sample", "eth_1s_sample", "macro_high_vol", "btc_binance_api", "eth_binance_api"],
+    )
 
     now = datetime.now().replace(microsecond=0)
     start_default = now - timedelta(hours=1)
@@ -233,6 +315,7 @@ def main() -> None:
     stream_count = st.sidebar.slider("stream_count", min_value=1, max_value=20, value=4)
     total_capital = st.sidebar.number_input("total_capital", min_value=100.0, value=1000.0, step=100.0)
     stability_ratio_threshold = st.sidebar.slider("stability_ratio_threshold", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
+    api_limit = st.sidebar.number_input("binance api candle limit", min_value=24, max_value=1000, value=600, step=1)
 
     st.sidebar.subheader("heuristic guard toggles")
     heuristics = {
@@ -259,6 +342,7 @@ def main() -> None:
             dataset=dataset,
             stability_ratio_threshold=stability_ratio_threshold,
             heuristic_guards=heuristics,
+            api_limit=int(api_limit),
         )
         st.session_state["sim_outputs"] = simulator.run(
             start_time=start_dt,
