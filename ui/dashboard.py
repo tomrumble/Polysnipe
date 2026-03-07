@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,7 @@ from src.engine import ResearchEngine
 from src.tape import MarketTape
 from src.edge.dataset_builder import EdgeDatasetBuilder
 from src.edge.edge_score import compute_edge_score
+from src.edge.metrics_pipeline import build_metrics_payload, load_metrics, persist_metrics
 from src.features import extract_features
 from src.signal_pipeline import (
     SignalConfig,
@@ -643,6 +645,12 @@ def main() -> None:
     st.title("Edge Validation")
     st.caption("Scientific instrument panel for statistically defensible edge validation")
 
+    metric_interval = max(1, int(os.getenv("METRIC_INTERVAL", "30")))
+    components.html(
+        f"""<script>setTimeout(function() {{ window.parent.location.reload(); }}, {metric_interval * 1000});</script>""",
+        height=0,
+    )
+
     st.sidebar.header("SIMULATOR CONTROL")
     dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api", "synthetic"])
 
@@ -812,16 +820,82 @@ def main() -> None:
         edge_status = "No Edge Detected"
         status_color = "#c62828"
 
+    model_version = "latest_persistence_model.pkl"
+    latest_model = Path("models/latest_persistence_model.pkl")
+    if latest_model.exists():
+        model_version = latest_model.name
+
+    latest_payload = build_metrics_payload(
+        telemetry=telemetry,
+        traded=traded,
+        edge_score=float(edge_score),
+        edge_status=edge_status,
+        calibration_error=calibration_error,
+        spearman_rank_correlation=spearman,
+        expected_value=profitability["expected_value"],
+        model_version=model_version,
+        dataset_size=len(telemetry),
+    )
+    metrics_artifact = persist_metrics(latest_payload, metrics_path=Path("metrics.json"))
+    artifact_latest = metrics_artifact.get("latest", latest_payload)
+    artifact_history = pd.DataFrame(metrics_artifact.get("history", []))
+
     st.markdown(
-        f"<div style='padding:0.9rem;border-radius:0.5rem;background:{status_color};color:white;font-weight:700;'>EDGE STATUS: {edge_status}</div>",
+        f"<div style='padding:0.9rem;border-radius:0.5rem;background:{status_color};color:white;font-weight:700;'>EDGE STATUS: {artifact_latest.get('edge_status', edge_status)}</div>",
         unsafe_allow_html=True,
     )
 
-    gauge = pd.DataFrame({"edge_score": [edge_score]})
+    gauge = pd.DataFrame({"edge_score": [artifact_latest.get("edge_score", edge_score)]})
     st.plotly_chart(
-        px.bar(gauge, x=["Edge Score"], y="edge_score", range_y=[0, 1], title=f"Edge Score Gauge: {edge_score:.2f}"),
+        px.bar(
+            gauge,
+            x=["Edge Score"],
+            y="edge_score",
+            range_y=[0, 1],
+            title=f"Edge Score Gauge: {artifact_latest.get('edge_score', edge_score):.2f}",
+        ),
         use_container_width=True,
     )
+
+    st.subheader("Metrics Service (metrics.json)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("training_samples", f"{int(artifact_latest.get('training_samples', len(telemetry))):,}")
+    c2.metric("dataset_size", f"{int(artifact_latest.get('dataset_size', len(telemetry))):,}")
+    c3.metric("model_version", str(artifact_latest.get("model_version", model_version)))
+    c4.metric("trade_selectivity", f"{float(artifact_latest.get('trade_selectivity', trade_rate)) * 100:.2f}%")
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("drift_distribution", f"{float(artifact_latest.get('drift_distribution', 0.0)):.4f}")
+    d2.metric("drift_prediction_correlation", f"{float(artifact_latest.get('drift_prediction_correlation', 0.0)):.3f}")
+    d3.metric("drift_prediction_rmse", f"{float(artifact_latest.get('drift_prediction_rmse', 0.0)):.4f}")
+
+    if not artifact_history.empty and "timestamp" in artifact_history.columns:
+        artifact_history["timestamp"] = pd.to_datetime(artifact_history["timestamp"], errors="coerce")
+        tracked = [
+            col for col in ["edge_score", "calibration_error", "spearman_rank_correlation", "drift_distribution"] if col in artifact_history.columns
+        ]
+        if tracked:
+            metrics_trend = artifact_history[["timestamp", *tracked]].melt(
+                id_vars="timestamp", var_name="metric", value_name="value"
+            )
+            st.plotly_chart(
+                px.line(metrics_trend, x="timestamp", y="value", color="metric", title="Metrics Service Trend History"),
+                use_container_width=True,
+            )
+
+    saved_metrics = load_metrics(Path("metrics.json"))
+    saved_hist = pd.DataFrame(saved_metrics.get("history", []))
+    if not saved_hist.empty and "drift_signal_histogram" in saved_hist.columns:
+        latest_histogram = saved_hist.iloc[-1].get("drift_signal_histogram", [])
+        hist_frame = pd.DataFrame(latest_histogram)
+        if not hist_frame.empty:
+            hist_frame["bin"] = hist_frame.apply(
+                lambda row: f"{float(row['bin_start']):.2f}-{float(row['bin_end']):.2f}", axis=1
+            )
+            st.plotly_chart(
+                px.bar(hist_frame, x="bin", y="count", title="Drift Signal Histogram (latest cycle)"),
+                use_container_width=True,
+            )
 
     run_config = st.session_state.get("last_simulation_config", {})
     run_config.setdefault("transaction_cost", transaction_cost)
