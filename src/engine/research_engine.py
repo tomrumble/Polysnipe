@@ -171,7 +171,7 @@ class ResearchEngine:
 
             observation = self.tape.next_tick()
             features = extract_features(observation)
-            signal = self.model.predict_signal(features.__dict__) if self.state.deployed_model_path else 0.5
+            signal = float(self.model.predict_signal(features.__dict__))
 
             future_frame = self.tape.peek_future(self.horizon_ticks)
             if "close" in future_frame.columns:

@@ -209,11 +209,15 @@ class TrainingEngine:
         }
 
     def _maybe_retrain(self) -> bool:
-        data = self._get_training_dataframe()
+        if self.dataset_preloaded:
+            data = pd.DataFrame(self.records)
+        else:
+            data = self.dataset_builder._load()
+
         print(
-            f"[TRAINING] dataset_size={len(data)} "
-            f"features={len(FEATURE_COLUMNS)} "
-            f"preloaded={self.dataset_preloaded}"
+            f"[TRAIN] dataset_size={len(data)} "
+            f"preloaded={self.dataset_preloaded} "
+            f"features={len(FEATURE_COLUMNS)}"
         )
         if len(data) < 100:
             return False
