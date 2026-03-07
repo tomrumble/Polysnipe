@@ -14,7 +14,7 @@ import pandas as pd
 class BinanceIngestor:
     """Fetches and incrementally stores 1-second Binance candles."""
 
-    def __init__(self, base_dir: str | Path = "datasets/binance", timeout: int = 15) -> None:
+    def __init__(self, base_dir: str | Path = "datasets/raw", timeout: int = 15) -> None:
         self.base_dir = Path(base_dir)
         self.timeout = timeout
 
