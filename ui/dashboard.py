@@ -520,10 +520,19 @@ def main() -> None:
     start_default = now - timedelta(hours=1)
     end_default = now
 
-    start_date = st.sidebar.date_input("start date", value=start_default.date())
-    start_clock = st.sidebar.time_input("start time", value=start_default.time())
-    end_date = st.sidebar.date_input("end date", value=end_default.date())
-    end_clock = st.sidebar.time_input("end time", value=end_default.time())
+    if "start_date" not in st.session_state:
+        st.session_state["start_date"] = start_default.date()
+    if "start_time" not in st.session_state:
+        st.session_state["start_time"] = start_default.time()
+    if "end_date" not in st.session_state:
+        st.session_state["end_date"] = end_default.date()
+    if "end_time" not in st.session_state:
+        st.session_state["end_time"] = end_default.time()
+
+    start_date = st.sidebar.date_input("start date", value=st.session_state["start_date"], key="start_date")
+    start_clock = st.sidebar.time_input("start time", value=st.session_state["start_time"], key="start_time")
+    end_date = st.sidebar.date_input("end date", value=st.session_state["end_date"], key="end_date")
+    end_clock = st.sidebar.time_input("end time", value=st.session_state["end_time"], key="end_time")
 
     stream_count = st.sidebar.slider("stream_count", min_value=1, max_value=20, value=4)
     total_capital = st.sidebar.number_input("total_capital", min_value=100.0, value=1000.0, step=100.0)
@@ -614,7 +623,7 @@ def main() -> None:
                 "entropy_threshold": entropy_threshold,
                 "accel_threshold": accel_threshold,
                 "spread_threshold": spread_threshold,
-                "seconds_remaining_threshold": seconds_threshold,
+                "evaluation_window_seconds": 60.0,
                 **heuristics,
             }
         except Exception as exc:
