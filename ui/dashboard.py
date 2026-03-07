@@ -661,11 +661,13 @@ def main() -> None:
     st.title("Edge Validation")
     st.caption("Scientific instrument panel for statistically defensible edge validation")
 
+    # NOTE:
+    # We intentionally avoid hard browser reloads here. The previous implementation
+    # injected `window.parent.location.reload()` on a timer, which recreates the
+    # Streamlit browser session and clears button-triggered run state. For longer
+    # training windows this could reset the app back to its initial load state
+    # without surfacing an error.
     metric_interval = max(1, int(os.getenv("METRIC_INTERVAL", "30")))
-    components.html(
-        f"""<script>setTimeout(function() {{ window.parent.location.reload(); }}, {metric_interval * 1000});</script>""",
-        height=0,
-    )
 
     st.sidebar.header("SIMULATOR CONTROL")
     dataset = st.sidebar.selectbox(
@@ -725,89 +727,105 @@ def main() -> None:
         st.session_state["run_error"] = ""
     if "engine_state" not in st.session_state:
         st.session_state["engine_state"] = None
+    if "last_run_started_at" not in st.session_state:
+        st.session_state["last_run_started_at"] = None
 
     if run_clicked:
         start_dt = datetime.combine(start_date, start_clock)
         end_dt = datetime.combine(end_date, end_clock)
-
-        try:
-            dataset_route = resolve_dataset_route(dataset)
-            if dataset_route.loader_name == "synthetic":
-                raise RuntimeError(
-                    "Training engine requires real market data. "
-                    "Select 'btc_binance_parquet', 'eth_binance_parquet', 'btc_binance_api', or 'eth_binance_api'."
-                )
-            # Use parquet path from route, or for API routes use same path convention (we create it below).
-            if dataset_route.loader_name == "parquet" and dataset_route.path:
-                parquet_path = _project_root / dataset_route.path
-            else:
-                parquet_path = _project_root / "datasets" / "binance" / f"{dataset_route.symbol}_1s.parquet"
-            if not parquet_path.exists():
-                parquet_path.parent.mkdir(parents=True, exist_ok=True)
-                with st.spinner(f"Creating parquet dataset for {dataset_route.symbol} ({start_dt.date()} to {end_dt.date()})..."):
-                    BinanceIngestor(base_dir=_project_root / "datasets" / "binance").ingest(
-                        symbol=dataset_route.symbol,
-                        start_time=start_dt,
-                        end_time=end_dt,
-                    )
-            tape = MarketTape(str(parquet_path))
-            engine = TrainingEngine(
-                tape=tape,
-                dataset_builder=EdgeDatasetBuilder(),
-                retrain_interval=1000,
-                metric_interval=100,
-                horizon_ticks=60,
-            )
-            engine.start()
-            max_iterations = max(int((end_dt - start_dt).total_seconds()), 1)
-            st.session_state["engine_state"] = engine.run(max_iterations=max_iterations)
-            engine.stop()
-            st.session_state["run_error"] = ""
-
-            if include_simulation:
-                simulator = ReplaySimulator(
-                    dataset=dataset,
-                    heuristic_guards=heuristics,
-                    signal_config=SignalConfig(
-                        stability_ratio_threshold=stability_ratio_threshold,
-                        entropy_threshold=entropy_threshold,
-                        accel_threshold=accel_threshold,
-                        spread_threshold=spread_threshold,
-                        evaluation_window_seconds=60.0,
-                    ),
-                    api_limit=int(api_limit),
-                    persistence_mode=persistence_mode,
-                )
-                st.session_state["sim_outputs"] = simulator.run(
-                    start_time=start_dt,
-                    end_time=end_dt,
-                    stream_count=stream_count,
-                    total_capital=total_capital,
-                    transaction_cost=transaction_cost,
-                )
-                st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
-                st.session_state["last_simulation_config"] = {
-                    "dataset": dataset,
-                    "start": start_dt,
-                    "end": end_dt,
-                    "stream_count": stream_count,
-                    "total_capital": total_capital,
-                    "stability_ratio_threshold": stability_ratio_threshold,
-                    "entropy_threshold": entropy_threshold,
-                    "accel_threshold": accel_threshold,
-                    "spread_threshold": spread_threshold,
-                    "evaluation_window_seconds": 60.0,
-                    "transaction_cost": transaction_cost,
-                    **heuristics,
-                }
-            else:
-                st.session_state["sim_outputs"] = None
-                st.session_state["last_simulation_output"] = None
-                st.session_state["last_simulation_config"] = None
-        except Exception as exc:
+        if end_dt <= start_dt:
+            st.session_state["run_error"] = "End time must be after start time."
             st.session_state["sim_outputs"] = None
             st.session_state["engine_state"] = None
-            st.session_state["run_error"] = str(exc)
+        else:
+            st.session_state["last_run_started_at"] = datetime.now()
+            engine = None
+
+            try:
+                dataset_route = resolve_dataset_route(dataset)
+                if dataset_route.loader_name == "synthetic":
+                    raise RuntimeError(
+                        "Training engine requires real market data. "
+                        "Select 'btc_binance_parquet', 'eth_binance_parquet', 'btc_binance_api', or 'eth_binance_api'."
+                    )
+                # Use parquet path from route, or for API routes use same path convention (we create it below).
+                if dataset_route.loader_name == "parquet" and dataset_route.path:
+                    parquet_path = _project_root / dataset_route.path
+                else:
+                    parquet_path = _project_root / "datasets" / "binance" / f"{dataset_route.symbol}_1s.parquet"
+                if not parquet_path.exists():
+                    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+                    with st.spinner(f"Creating parquet dataset for {dataset_route.symbol} ({start_dt.date()} to {end_dt.date()})..."):
+                        BinanceIngestor(base_dir=_project_root / "datasets" / "binance").ingest(
+                            symbol=dataset_route.symbol,
+                            start_time=start_dt,
+                            end_time=end_dt,
+                        )
+                tape = MarketTape(str(parquet_path))
+                engine = TrainingEngine(
+                    tape=tape,
+                    dataset_builder=EdgeDatasetBuilder(),
+                    retrain_interval=1000,
+                    metric_interval=100,
+                    horizon_ticks=60,
+                )
+                engine.start()
+                max_iterations = max(int((end_dt - start_dt).total_seconds()), 1)
+                st.session_state["engine_state"] = engine.run(max_iterations=max_iterations)
+                st.session_state["run_error"] = ""
+
+                if include_simulation:
+                    simulator = ReplaySimulator(
+                        dataset=dataset,
+                        heuristic_guards=heuristics,
+                        signal_config=SignalConfig(
+                            stability_ratio_threshold=stability_ratio_threshold,
+                            entropy_threshold=entropy_threshold,
+                            accel_threshold=accel_threshold,
+                            spread_threshold=spread_threshold,
+                            evaluation_window_seconds=60.0,
+                        ),
+                        api_limit=int(api_limit),
+                        persistence_mode=persistence_mode,
+                    )
+                    st.session_state["sim_outputs"] = simulator.run(
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        stream_count=stream_count,
+                        total_capital=total_capital,
+                        transaction_cost=transaction_cost,
+                    )
+                    st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
+                    st.session_state["last_simulation_config"] = {
+                        "dataset": dataset,
+                        "start": start_dt,
+                        "end": end_dt,
+                        "stream_count": stream_count,
+                        "total_capital": total_capital,
+                        "stability_ratio_threshold": stability_ratio_threshold,
+                        "entropy_threshold": entropy_threshold,
+                        "accel_threshold": accel_threshold,
+                        "spread_threshold": spread_threshold,
+                        "evaluation_window_seconds": 60.0,
+                        "transaction_cost": transaction_cost,
+                        **heuristics,
+                    }
+                else:
+                    st.session_state["sim_outputs"] = None
+                    st.session_state["last_simulation_output"] = None
+                    st.session_state["last_simulation_config"] = None
+            except Exception as exc:
+                st.session_state["sim_outputs"] = None
+                st.session_state["engine_state"] = None
+                st.session_state["run_error"] = str(exc)
+            finally:
+                if engine is not None:
+                    engine.stop()
+
+    if st.session_state.get("engine_state") is not None and st.session_state.get("last_run_started_at"):
+        completed_at = datetime.now()
+        elapsed = completed_at - st.session_state["last_run_started_at"]
+        st.caption(f"Last training run duration: {elapsed}")
 
     engine_state = st.session_state.get("engine_state")
     outputs: SimulationOutputs | None = st.session_state["sim_outputs"]
