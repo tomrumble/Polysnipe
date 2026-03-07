@@ -136,8 +136,18 @@ class TrainingEngine:
         brier = float(brier_score_loss(y_test, probs))
         return {"roc_auc": auc, "brier": brier, "calibration": 1.0 - brier}
 
+    def _get_training_dataframe(self) -> pd.DataFrame:
+        """
+        Return the dataset used for training depending on runtime mode.
+        """
+        if self.dataset_preloaded:
+            if not self.records:
+                return pd.DataFrame()
+            return pd.DataFrame(self.records)
+        return self.dataset_builder._load()
+
     def _recompute_metrics(self) -> None:
-        data = self.dataset_builder._load()
+        data = self._get_training_dataframe()
         size = int(len(data))
         self.state.dataset_size = size
         if data.empty:
@@ -153,7 +163,12 @@ class TrainingEngine:
         }
 
     def _maybe_retrain(self) -> bool:
-        data = self.dataset_builder._load()
+        data = self._get_training_dataframe()
+        print(
+            f"[TRAINING] dataset_size={len(data)} "
+            f"features={len(FEATURE_COLUMNS)} "
+            f"preloaded={self.dataset_preloaded}"
+        )
         if len(data) < 100:
             return False
 
@@ -274,7 +289,7 @@ class TrainingEngine:
             features = extract_features(observation)
             persistence_label = self._selected_label(observation, future_path)
 
-        signal = self.model.predict_signal(features.__dict__) if self.state.deployed_model_path else 0.5
+        signal = float(self.model.predict_signal(features.__dict__))
         trade_decision = self.policy.evaluate(probability=float(signal))
 
         if not precomputed:
