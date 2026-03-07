@@ -1,8 +1,6 @@
 from pathlib import Path
 import sys
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data import resolve_dataset_route
@@ -22,6 +20,8 @@ def test_eth_binance_api_route_uses_ethusdt_and_binance_loader():
     assert route.source == "binance_api"
 
 
-def test_unknown_dataset_route_raises_value_error():
-    with pytest.raises(ValueError, match="Unknown dataset"):
-        resolve_dataset_route("synthetic")
+def test_synthetic_route_uses_synthetic_loader():
+    route = resolve_dataset_route("synthetic")
+    assert route.loader_name == "synthetic"
+    assert route.symbol == "synthetic"
+    assert route.source == "synthetic"

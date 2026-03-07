@@ -17,6 +17,7 @@ class DatasetRoute:
 DATASET_LOADERS: dict[str, str] = {
     "btc_binance_api": "binance_api",
     "eth_binance_api": "binance_api",
+    "synthetic": "synthetic",
 }
 
 
@@ -27,4 +28,6 @@ def resolve_dataset_route(dataset_name: str) -> DatasetRoute:
 
     if dataset_name == "btc_binance_api":
         return DatasetRoute(dataset_name, loader_name, symbol="BTCUSDT", source="binance_api")
-    return DatasetRoute(dataset_name, loader_name, symbol="ETHUSDT", source="binance_api")
+    if dataset_name == "eth_binance_api":
+        return DatasetRoute(dataset_name, loader_name, symbol="ETHUSDT", source="binance_api")
+    return DatasetRoute(dataset_name, loader_name, symbol="synthetic", source="synthetic")

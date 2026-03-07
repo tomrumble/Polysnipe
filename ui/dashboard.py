@@ -20,7 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
-from src.data import fetch_binance_klines_paginated, resolve_dataset_route
+from src.data import DatasetDiagnostics, fetch_binance_klines_paginated, resolve_dataset_route
 from src.persistence_model import PersistenceInputs, PersistenceModel
 from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
@@ -46,6 +46,7 @@ class ReplaySimulator:
     DATASET_SEEDS: Dict[str, int] = {
         "btc_binance_api": 17,
         "eth_binance_api": 43,
+        "synthetic": 99,
     }
     API_DATASET_SYMBOLS: Dict[str, str] = {
         "btc_binance_api": "BTCUSDT",
@@ -156,6 +157,30 @@ class ReplaySimulator:
         path = frame["price"].to_numpy(dtype=float)
         return timestamps, path, dataset_diagnostics
 
+    def _load_synthetic_dataset(
+        self,
+        *,
+        rng: np.random.Generator,
+        base_vol: float,
+        timestamps: pd.DatetimeIndex,
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, Dict[str, float | int | str | bool]]:
+        n = len(timestamps)
+        noise = rng.normal(0, base_vol, n)
+        drift = rng.normal(0.01, 0.05, n).cumsum() / 12
+        path = 100 + np.cumsum(noise + drift)
+        diagnostics = {
+            "api_source": "synthetic",
+            "dataset_loaded": "synthetic",
+            "symbol": "synthetic",
+            "interval": "1s",
+            "api_limit_per_request": 0,
+            "api_requests_used": 0,
+            "candles_loaded": n,
+            "expected_candles_for_range": n,
+            "data_truncation_detected": False,
+        }
+        return timestamps, path, diagnostics
+
     def run(
         self,
         start_time: datetime,
@@ -175,6 +200,7 @@ class ReplaySimulator:
         base_vol = {
             "btc_binance_api": 1.2,
             "eth_binance_api": 1.7,
+            "synthetic": 2.6,
         }.get(self.dataset, 1.3)
 
         timestamps = pd.date_range(start_time, periods=n, freq="s")
@@ -182,22 +208,29 @@ class ReplaySimulator:
         dataset_route = resolve_dataset_route(self.dataset)
         dataset_loader = dataset_route.loader_name
 
-        if dataset_loader != "binance_api":
-            raise RuntimeError(f"Dataset loader failed: {self.dataset}")
-
-        try:
-            timestamps, path, dataset_diagnostics = self._load_binance_dataset(
-                dataset_name=dataset_route.dataset_name,
-                start_time=start_time,
-                end_time=end_time,
-                n=n,
+        if dataset_loader == "binance_api":
+            try:
+                timestamps, path, dataset_diagnostics = self._load_binance_dataset(
+                    dataset_name=dataset_route.dataset_name,
+                    start_time=start_time,
+                    end_time=end_time,
+                    n=n,
+                )
+                n = len(path)
+                dataset_diagnostics["dataset_loaded"] = self.dataset
+            except Exception as exc:
+                raise RuntimeError(f"Dataset loader failed: {self.dataset}") from exc
+        else:
+            timestamps, path, dataset_diagnostics = self._load_synthetic_dataset(
+                rng=rng,
+                base_vol=base_vol,
+                timestamps=timestamps,
             )
             n = len(path)
-            dataset_diagnostics["dataset_loaded"] = self.dataset
-        except Exception as exc:
-            raise RuntimeError(f"Dataset loader failed: {self.dataset}") from exc
 
-        if dataset_diagnostics.get("api_source") != "binance_api":
+        dataset_diagnostics.setdefault("dataset_loaded", self.dataset if dataset_loader == "binance_api" else "synthetic")
+
+        if dataset_diagnostics.get("api_source") == "synthetic" and self.dataset != "synthetic":
             raise RuntimeError("Dataset mismatch detected")
 
         telemetry_rows: List[Dict[str, float | int | str]] = []
@@ -454,7 +487,7 @@ def main() -> None:
     st.caption("Late-stage market collapse detector diagnostics")
 
     st.sidebar.header("SIMULATOR CONTROL")
-    dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api"])
+    dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api", "synthetic"])
 
     now = datetime.now().replace(microsecond=0)
     start_default = now - timedelta(hours=1)
@@ -531,7 +564,7 @@ def main() -> None:
                 "entropy_threshold": entropy_threshold,
                 "accel_threshold": accel_threshold,
                 "spread_threshold": spread_threshold,
-                "evaluation_window_seconds": 60,
+                "seconds_remaining_threshold": seconds_threshold,
                 **heuristics,
             }
         except Exception as exc:
@@ -553,15 +586,12 @@ def main() -> None:
         )
         _copy_metrics_component(report)
 
-    st.subheader("Dataset Load Totals")
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("dataset selected", str(st.session_state.get("last_simulation_config", {}).get("dataset", "")))
-    d2.metric("api source", str(outputs.dataset_diagnostics.get("api_source", "")))
-    d3.metric("candles loaded", int(outputs.dataset_diagnostics.get("candles_loaded", 0)))
-    d4.metric("api requests", int(outputs.dataset_diagnostics.get("api_requests_used", 0)))
-    st.caption(
-        f"Expected candles for selected range: {int(outputs.dataset_diagnostics.get('expected_candles_for_range', 0))}"
-    )
+    loaded_source = outputs.dataset_diagnostics.get("api_source", "")
+    selected_dataset = st.session_state.get("last_simulation_config", {}).get("dataset", "")
+    if loaded_source == "synthetic" and selected_dataset != "synthetic":
+        st.warning(
+            f"DATASET WARNING\nDataset selected: {selected_dataset}\nDataset loaded: {loaded_source}"
+        )
 
     telemetry = outputs.telemetry
     trades = outputs.trades
