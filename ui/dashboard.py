@@ -7,6 +7,7 @@ Run with:
 from __future__ import annotations
 
 import json
+import html
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,9 +19,11 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
 from src.persistence_model import PersistenceInputs, PersistenceModel
+from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
     SignalConfig,
     SignalInputs,
@@ -163,6 +166,7 @@ class ReplaySimulator:
         stream_balances = np.full(stream_count, total_capital / stream_count)
         equity_points: List[float] = []
         last_volatility = 0.0
+        entropy_history: List[float] = []
 
         for i in range(max(self.entropy_window, 20), n - 1):
             current_price = float(path[i])
@@ -189,6 +193,10 @@ class ReplaySimulator:
             accel = float((path[i] - path[i - 1]) - (path[i - 1] - path[i - 2]))
             spread = float(abs(rng.normal(0.012 * (1 + out.volatility / 3), 0.004)))
             entropy_value = float(directional_entropy(path[: i + 1].tolist(), window=self.entropy_window))
+            entropy_history.append(entropy_value)
+            entropy_slope_before_entry = 0.0
+            if len(entropy_history) >= 4:
+                entropy_slope_before_entry = float(entropy_history[-1] - entropy_history[-4])
             regime = classify_regime(
                 volatility=out.volatility,
                 directional_entropy_value=entropy_value,
@@ -266,6 +274,7 @@ class ReplaySimulator:
                 "stability_ratio_at_entry": out.stability_ratio,
                 "directional_entropy": entropy_value,
                 "entropy_at_entry": entropy_value,
+                "entropy_slope_before_entry": entropy_slope_before_entry,
                 "spread": spread,
                 "spread_at_entry": spread,
                 "price_acceleration": accel,
@@ -343,6 +352,26 @@ def _success_vs_feature(traded: pd.DataFrame, feature: str, bins: int = 8) -> pd
     return grouped[["bucket", "success_rate"]]
 
 
+def _copy_text_to_clipboard(payload: str) -> bool:
+    try:
+        import pyperclip
+
+        pyperclip.copy(payload)
+        return True
+    except Exception:
+        escaped_payload = html.escape(json.dumps(payload))
+        components.html(
+            f"""
+            <script>
+                const reportText = JSON.parse('{escaped_payload}');
+                navigator.clipboard.writeText(reportText);
+            </script>
+            """,
+            height=0,
+        )
+        return True
+
+
 def main() -> None:
     st.set_page_config(page_title="Trading Simulator Research Dashboard", layout="wide")
     st.title("Trading Simulator Research Dashboard")
@@ -384,6 +413,10 @@ def main() -> None:
 
     if "sim_outputs" not in st.session_state:
         st.session_state["sim_outputs"] = None
+    if "last_simulation_output" not in st.session_state:
+        st.session_state["last_simulation_output"] = None
+    if "last_simulation_config" not in st.session_state:
+        st.session_state["last_simulation_config"] = None
 
     if run_clicked:
         start_dt = datetime.combine(start_date, start_clock)
@@ -408,11 +441,34 @@ def main() -> None:
             stream_count=stream_count,
             total_capital=total_capital,
         )
+        st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
+        st.session_state["last_simulation_config"] = {
+            "dataset": dataset,
+            "start": start_dt,
+            "end": end_dt,
+            "stream_count": stream_count,
+            "total_capital": total_capital,
+            "stability_ratio_threshold": stability_ratio_threshold,
+            "entropy_threshold": entropy_threshold,
+            "accel_threshold": accel_threshold,
+            "spread_threshold": spread_threshold,
+            "seconds_remaining_threshold": seconds_threshold,
+            **heuristics,
+        }
 
     outputs: SimulationOutputs | None = st.session_state["sim_outputs"]
     if outputs is None:
         st.info("Set parameters and click **Run Simulation**.")
         return
+
+    if st.session_state.get("last_simulation_output") is not None:
+        if st.button("Copy Metrics to Clipboard"):
+            report = generate_simulation_report(
+                st.session_state["last_simulation_output"],
+                st.session_state.get("last_simulation_config") or {},
+            )
+            _copy_text_to_clipboard(report)
+            st.success("Simulation report copied to clipboard")
 
     telemetry = outputs.telemetry
     trades = outputs.trades
