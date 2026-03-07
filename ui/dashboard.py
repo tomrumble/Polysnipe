@@ -20,7 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
-from src.data import fetch_binance_klines_paginated
+from src.data import fetch_binance_klines_paginated, resolve_dataset_route
 from src.persistence_model import PersistenceInputs, PersistenceModel
 from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
@@ -44,9 +44,8 @@ class ReplaySimulator:
     """Lightweight replay simulator for research experimentation."""
 
     DATASET_SEEDS: Dict[str, int] = {
-        "btc_1s_sample": 17,
-        "eth_1s_sample": 43,
-        "macro_high_vol": 99,
+        "btc_binance_api": 17,
+        "eth_binance_api": 43,
     }
     API_DATASET_SYMBOLS: Dict[str, str] = {
         "btc_binance_api": "BTCUSDT",
@@ -71,12 +70,21 @@ class ReplaySimulator:
         self.model = PersistenceModel(center=1.0, slope=1.7, mode=persistence_mode)
 
     @classmethod
-    def _cache_path(cls, symbol: str, limit: int) -> Path:
-        return cls.CACHE_DIR / f"{symbol.lower()}_1s_{limit}.csv"
+    def _cache_path(cls, symbol: str, limit: int, start_time: datetime, end_time: datetime) -> Path:
+        start_token = start_time.strftime("%Y%m%dT%H%M%S")
+        end_token = end_time.strftime("%Y%m%dT%H%M%S")
+        return cls.CACHE_DIR / f"{symbol.lower()}_1s_{start_token}_{end_token}_{limit}.csv"
 
     @classmethod
-    def _load_cached_binance_prices(cls, symbol: str, limit: int) -> pd.DataFrame:
-        cache_path = cls._cache_path(symbol, limit)
+    def _load_cached_binance_prices(
+        cls,
+        *,
+        symbol: str,
+        limit: int,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> pd.DataFrame:
+        cache_path = cls._cache_path(symbol, limit, start_time, end_time)
         if not cache_path.exists():
             return pd.DataFrame(columns=["timestamp", "price"])
 
@@ -85,6 +93,7 @@ class ReplaySimulator:
             return pd.DataFrame(columns=["timestamp", "price"])
 
         cached["timestamp"] = pd.to_datetime(cached["timestamp"])
+        cached = cached[(cached["timestamp"] >= start_time) & (cached["timestamp"] < end_time)].copy()
         return cached[["timestamp", "price"]]
 
     @classmethod
@@ -95,11 +104,13 @@ class ReplaySimulator:
         end_time: datetime,
         limit: int,
     ) -> tuple[pd.DataFrame, Dict[str, float | int | str | bool]]:
-        cached = cls._load_cached_binance_prices(symbol=symbol, limit=limit)
+        cached = cls._load_cached_binance_prices(symbol=symbol, limit=limit, start_time=start_time, end_time=end_time)
         if not cached.empty:
             expected = max(int((end_time - start_time).total_seconds()), 1)
             diagnostics = {
-                "api_source": "binance",
+                "api_source": "binance_api",
+                "symbol": symbol,
+                "interval": "1s",
                 "api_limit_per_request": limit,
                 "api_requests_used": 0,
                 "candles_loaded": int(len(cached)),
@@ -121,8 +132,29 @@ class ReplaySimulator:
             return frame, diagnostics_obj.__dict__
 
         cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        frame.to_csv(cls._cache_path(symbol=symbol, limit=limit), index=False)
+        frame.to_csv(cls._cache_path(symbol=symbol, limit=limit, start_time=start_time, end_time=end_time), index=False)
         return frame, diagnostics_obj.__dict__
+
+    def _load_binance_dataset(
+        self,
+        *,
+        dataset_name: str,
+        start_time: datetime,
+        end_time: datetime,
+        n: int,
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, Dict[str, float | int | str | bool]]:
+        symbol = self.API_DATASET_SYMBOLS[dataset_name]
+        frame, dataset_diagnostics = self._fetch_binance_prices(
+            symbol=symbol,
+            start_time=start_time,
+            end_time=end_time,
+            limit=min(self.api_limit, 1000),
+        )
+        if len(frame) < 24:
+            raise RuntimeError(f"Dataset loader failed: {dataset_name}")
+        timestamps = pd.to_datetime(frame["timestamp"])
+        path = frame["price"].to_numpy(dtype=float)
+        return timestamps, path, dataset_diagnostics
 
     def run(
         self,
@@ -141,38 +173,32 @@ class ReplaySimulator:
         rng = np.random.default_rng(seed)
 
         base_vol = {
-            "btc_1s_sample": 1.2,
             "btc_binance_api": 1.2,
-            "eth_1s_sample": 1.7,
             "eth_binance_api": 1.7,
-            "macro_high_vol": 2.6,
         }.get(self.dataset, 1.3)
 
         timestamps = pd.date_range(start_time, periods=n, freq="s")
 
-        if self.dataset in self.API_DATASET_SYMBOLS:
-            symbol = self.API_DATASET_SYMBOLS[self.dataset]
-            try:
-                frame, dataset_diagnostics = self._fetch_binance_prices(
-                    symbol=symbol,
-                    start_time=start_time,
-                    end_time=end_time,
-                    limit=min(self.api_limit, 1000),
-                )
-                if len(frame) >= 24:
-                    timestamps = pd.to_datetime(frame["timestamp"])
-                    path = frame["price"].to_numpy(dtype=float)
-                    n = len(path)
-                else:
-                    raise ValueError("Binance returned insufficient candles for simulation")
-            except Exception:
-                noise = rng.normal(0, base_vol, n)
-                drift = rng.normal(0.01, 0.05, n).cumsum() / 12
-                path = 100 + np.cumsum(noise + drift)
-        else:
-            noise = rng.normal(0, base_vol, n)
-            drift = rng.normal(0.01, 0.05, n).cumsum() / 12
-            path = 100 + np.cumsum(noise + drift)
+        dataset_route = resolve_dataset_route(self.dataset)
+        dataset_loader = dataset_route.loader_name
+
+        if dataset_loader != "binance_api":
+            raise RuntimeError(f"Dataset loader failed: {self.dataset}")
+
+        try:
+            timestamps, path, dataset_diagnostics = self._load_binance_dataset(
+                dataset_name=dataset_route.dataset_name,
+                start_time=start_time,
+                end_time=end_time,
+                n=n,
+            )
+            n = len(path)
+            dataset_diagnostics["dataset_loaded"] = self.dataset
+        except Exception as exc:
+            raise RuntimeError(f"Dataset loader failed: {self.dataset}") from exc
+
+        if dataset_diagnostics.get("api_source") != "binance_api":
+            raise RuntimeError("Dataset mismatch detected")
 
         telemetry_rows: List[Dict[str, float | int | str]] = []
         trades_rows: List[Dict[str, float | int | str]] = []
@@ -181,14 +207,6 @@ class ReplaySimulator:
         equity_points: List[float] = []
         last_volatility = 0.0
         entropy_history: List[float] = []
-        dataset_diagnostics: Dict[str, float | int | str | bool] = {
-            "api_source": "synthetic",
-            "api_limit_per_request": 0,
-            "api_requests_used": 0,
-            "candles_loaded": n,
-            "expected_candles_for_range": n,
-            "data_truncation_detected": False,
-        }
 
         for i in range(max(self.entropy_window, 20), n - 1):
             current_price = float(path[i])
@@ -197,7 +215,7 @@ class ReplaySimulator:
             boundary_price = current_price + boundary_side * boundary_delta
             recent_prices = path[i - 20 : i + 1].tolist()
 
-            expiry_idx = min(i + 30, n - 1)
+            expiry_idx = min(i + 60, n - 1)
             seconds_remaining = float((timestamps[expiry_idx] - timestamps[i]).total_seconds())
             now_ts = timestamps[i].timestamp()
             expiry_ts = timestamps[expiry_idx].timestamp()
@@ -217,8 +235,10 @@ class ReplaySimulator:
             entropy_value = float(directional_entropy(path[: i + 1].tolist(), window=self.entropy_window))
             entropy_history.append(entropy_value)
             entropy_slope_before_entry = 0.0
+            entropy_velocity = 0.0
             if len(entropy_history) >= 4:
-                entropy_slope_before_entry = float(entropy_history[-1] - entropy_history[-4])
+                entropy_velocity = float(entropy_history[-1] - entropy_history[-4])
+                entropy_slope_before_entry = entropy_velocity
             regime = classify_regime(
                 volatility=out.volatility,
                 directional_entropy_value=entropy_value,
@@ -232,6 +252,7 @@ class ReplaySimulator:
                     seconds_remaining=seconds_remaining,
                     spread=spread,
                     directional_entropy=entropy_value,
+                    entropy_velocity=entropy_velocity,
                     price_acceleration=accel,
                     stability_ratio=out.stability_ratio,
                     volatility_current=out.volatility,
@@ -298,6 +319,7 @@ class ReplaySimulator:
                 "directional_entropy": entropy_value,
                 "entropy_at_entry": entropy_value,
                 "entropy_slope_before_entry": entropy_slope_before_entry,
+                "entropy_velocity": entropy_velocity,
                 "spread": spread,
                 "spread_at_entry": spread,
                 "price_acceleration": accel,
@@ -432,7 +454,7 @@ def main() -> None:
     st.caption("Late-stage market collapse detector diagnostics")
 
     st.sidebar.header("SIMULATOR CONTROL")
-    dataset = st.sidebar.selectbox("dataset selector", ["btc_1s_sample", "eth_1s_sample", "macro_high_vol", "btc_binance_api", "eth_binance_api"])
+    dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api"])
 
     now = datetime.now().replace(microsecond=0)
     start_default = now - timedelta(hours=1)
@@ -453,7 +475,6 @@ def main() -> None:
     entropy_threshold = st.sidebar.slider("entropy_threshold", min_value=0.05, max_value=0.69, value=0.62, step=0.01)
     accel_threshold = st.sidebar.slider("accel_threshold", min_value=0.05, max_value=2.0, value=0.45, step=0.05)
     spread_threshold = st.sidebar.slider("spread_threshold", min_value=0.005, max_value=0.05, value=0.02, step=0.001)
-    seconds_threshold = st.sidebar.slider("seconds_remaining_threshold", min_value=5.0, max_value=30.0, value=15.0, step=1.0)
 
     st.sidebar.subheader("heuristic guard toggles")
     heuristics = {
@@ -471,6 +492,8 @@ def main() -> None:
         st.session_state["last_simulation_output"] = None
     if "last_simulation_config" not in st.session_state:
         st.session_state["last_simulation_config"] = None
+    if "run_error" not in st.session_state:
+        st.session_state["run_error"] = ""
 
     if run_clicked:
         start_dt = datetime.combine(start_date, start_clock)
@@ -484,35 +507,43 @@ def main() -> None:
                 entropy_threshold=entropy_threshold,
                 accel_threshold=accel_threshold,
                 spread_threshold=spread_threshold,
-                seconds_remaining_threshold=seconds_threshold,
+                evaluation_window_seconds=60.0,
             ),
             api_limit=int(api_limit),
             persistence_mode=persistence_mode,
         )
-        st.session_state["sim_outputs"] = simulator.run(
-            start_time=start_dt,
-            end_time=end_dt,
-            stream_count=stream_count,
-            total_capital=total_capital,
-        )
-        st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
-        st.session_state["last_simulation_config"] = {
-            "dataset": dataset,
-            "start": start_dt,
-            "end": end_dt,
-            "stream_count": stream_count,
-            "total_capital": total_capital,
-            "stability_ratio_threshold": stability_ratio_threshold,
-            "entropy_threshold": entropy_threshold,
-            "accel_threshold": accel_threshold,
-            "spread_threshold": spread_threshold,
-            "seconds_remaining_threshold": seconds_threshold,
-            **heuristics,
-        }
+        try:
+            st.session_state["sim_outputs"] = simulator.run(
+                start_time=start_dt,
+                end_time=end_dt,
+                stream_count=stream_count,
+                total_capital=total_capital,
+            )
+            st.session_state["run_error"] = ""
+            st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
+            st.session_state["last_simulation_config"] = {
+                "dataset": dataset,
+                "start": start_dt,
+                "end": end_dt,
+                "stream_count": stream_count,
+                "total_capital": total_capital,
+                "stability_ratio_threshold": stability_ratio_threshold,
+                "entropy_threshold": entropy_threshold,
+                "accel_threshold": accel_threshold,
+                "spread_threshold": spread_threshold,
+                "evaluation_window_seconds": 60,
+                **heuristics,
+            }
+        except Exception as exc:
+            st.session_state["sim_outputs"] = None
+            st.session_state["run_error"] = str(exc)
 
     outputs: SimulationOutputs | None = st.session_state["sim_outputs"]
     if outputs is None:
-        st.info("Set parameters and click **Run Simulation**.")
+        if st.session_state.get("run_error"):
+            st.error(f"DATASET ERROR: {st.session_state['run_error']}")
+        else:
+            st.info("Set parameters and click **Run Simulation**.")
         return
 
     if st.session_state.get("last_simulation_output") is not None:
@@ -521,6 +552,16 @@ def main() -> None:
             st.session_state.get("last_simulation_config") or {},
         )
         _copy_metrics_component(report)
+
+    st.subheader("Dataset Load Totals")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("dataset selected", str(st.session_state.get("last_simulation_config", {}).get("dataset", "")))
+    d2.metric("api source", str(outputs.dataset_diagnostics.get("api_source", "")))
+    d3.metric("candles loaded", int(outputs.dataset_diagnostics.get("candles_loaded", 0)))
+    d4.metric("api requests", int(outputs.dataset_diagnostics.get("api_requests_used", 0)))
+    st.caption(
+        f"Expected candles for selected range: {int(outputs.dataset_diagnostics.get('expected_candles_for_range', 0))}"
+    )
 
     telemetry = outputs.telemetry
     trades = outputs.trades

@@ -86,7 +86,10 @@ def test_generate_simulation_report_with_trades_and_new_diagnostics():
             trades=trades,
             equity_curve=equity_curve,
             dataset_diagnostics={
-                "api_source": "binance",
+                "api_source": "binance_api",
+                "dataset_loaded": "btc_binance_api",
+                "symbol": "BTCUSDT",
+                "interval": "1s",
                 "api_limit_per_request": 1000,
                 "api_requests_used": 2,
                 "candles_loaded": 2200,
@@ -104,7 +107,7 @@ def test_generate_simulation_report_with_trades_and_new_diagnostics():
             "entropy_threshold": 0.62,
             "accel_threshold": 0.45,
             "spread_threshold": 0.02,
-            "seconds_remaining_threshold": 30,
+            "evaluation_window_seconds": 60,
             "acceleration_veto": True,
             "oscillation_veto": True,
             "spread_veto": True,
@@ -121,9 +124,17 @@ def test_generate_simulation_report_with_trades_and_new_diagnostics():
     assert "EVALUATION TIMING DISTRIBUTION" in report
     assert "0-5: 1" in report
     assert "10-20: 1" in report
-    assert "30+: 1" in report
+    assert "30-60: 1" in report
+    assert "DATASET SOURCE" in report
+    assert "dataset_selected: btc_binance_api" in report
+    assert "dataset_loaded: btc_binance_api" in report
+    assert "symbol: BTCUSDT" in report
+    assert "interval: 1s" in report
     assert "DATASET DIAGNOSTICS" in report
     assert "api_limit_per_request: 1000" in report
+    assert "LOADED DATA TOTALS" in report
+    assert "candles_loaded_total: 2200" in report
+    assert "api_requests_used_total: 2" in report
 
 
 def test_generate_simulation_report_warning_when_no_collapse_signals():

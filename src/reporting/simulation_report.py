@@ -19,7 +19,6 @@ VETO_ORDER = [
     "spread_guard",
     "acceleration_guard",
     "stability_guard",
-    "time_guard",
 ]
 
 COLLAPSE_BLOCKER_ORDER = [
@@ -31,7 +30,7 @@ COLLAPSE_BLOCKER_ORDER = [
     "regime_not_supported",
 ]
 
-EVAL_BUCKETS = ["0-5", "5-10", "10-20", "20-30", "30+"]
+EVAL_BUCKETS = ["0-5", "5-10", "10-20", "20-30", "30-60", "60+"]
 
 
 def _read_frame(simulation_output: Any, field_name: str) -> pd.DataFrame:
@@ -96,8 +95,10 @@ def _eval_timing_distribution(telemetry: pd.DataFrame) -> Dict[str, int]:
             counts["10-20"] += 1
         elif seconds <= 30:
             counts["20-30"] += 1
+        elif seconds <= 60:
+            counts["30-60"] += 1
         else:
-            counts["30+"] += 1
+            counts["60+"] += 1
     return counts
 
 
@@ -175,7 +176,7 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
         f"entropy_threshold: {float(config.get('entropy_threshold', 0.0)):.2f}",
         f"accel_threshold: {float(config.get('accel_threshold', 0.0)):.2f}",
         f"spread_threshold: {float(config.get('spread_threshold', 0.0)):.2f}",
-        f"seconds_remaining_threshold: {int(config.get('seconds_remaining_threshold', 0))}",
+        f"evaluation_window_seconds: {int(config.get('evaluation_window_seconds', 60))}",
         "",
         "HEURISTIC GUARDS",
         "----------------",
@@ -277,6 +278,13 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
             f"markets_simulated: {config.get('stream_count', '')}",
             "time_resolution_seconds: 1",
             "",
+            "DATASET SOURCE",
+            "--------------",
+            f"dataset_selected: {config.get('dataset', '')}",
+            f"dataset_loaded: {dataset_diagnostics.get('dataset_loaded', dataset_diagnostics.get('api_source', ''))}",
+            f"symbol: {dataset_diagnostics.get('symbol', '')}",
+            f"interval: {dataset_diagnostics.get('interval', '')}",
+            "",
             "DATASET DIAGNOSTICS",
             "-------------------",
             f"api_source: {dataset_diagnostics.get('api_source', '')}",
@@ -285,6 +293,12 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
             f"candles_loaded: {dataset_diagnostics.get('candles_loaded', '')}",
             f"expected_candles_for_range: {dataset_diagnostics.get('expected_candles_for_range', '')}",
             f"data_truncation_detected: {str(bool(dataset_diagnostics.get('data_truncation_detected', False))).lower()}",
+            "",
+            "LOADED DATA TOTALS",
+            "------------------",
+            f"candles_loaded_total: {dataset_diagnostics.get('candles_loaded', '')}",
+            f"expected_candles_total: {dataset_diagnostics.get('expected_candles_for_range', '')}",
+            f"api_requests_used_total: {dataset_diagnostics.get('api_requests_used', '')}",
             "",
             "SIMULATION WARNINGS",
             "-------------------",

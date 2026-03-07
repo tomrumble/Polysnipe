@@ -22,6 +22,7 @@ SUPPORTED_COLLAPSE_REGIMES = {"PERSISTENT_COMPRESSION", "LATE_MARKET_FREEZE"}
 class CollapseInputs:
     spread: float
     directional_entropy: float
+    entropy_velocity: float
     price_acceleration: float
     stability_ratio: float
     volatility_current: float
@@ -48,7 +49,10 @@ def evaluate_collapse_stage(
     if inputs.regime_label not in SUPPORTED_COLLAPSE_REGIMES:
         return CollapseDecision(False, CollapseReason.REGIME_NOT_SUPPORTED.value)
 
-    if inputs.directional_entropy >= entropy_threshold:
+    entropy_collapsing = (
+        inputs.directional_entropy < entropy_threshold or inputs.entropy_velocity < -0.1
+    )
+    if not entropy_collapsing:
         return CollapseDecision(False, CollapseReason.ENTROPY_NOT_COLLAPSING.value)
 
     if inputs.spread >= spread_threshold:

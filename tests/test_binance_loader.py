@@ -57,6 +57,9 @@ def test_pagination_loader_retrieves_more_than_1000_candles():
 
     assert len(frame) == 2500
     assert diagnostics.api_requests_used == 3
+    assert diagnostics.api_source == "binance_api"
+    assert diagnostics.symbol == "BTCUSDT"
+    assert diagnostics.interval == "1s"
     assert frame["open_time_ms"].is_monotonic_increasing
     assert frame["open_time_ms"].is_unique
 
