@@ -1,0 +1,29 @@
+{
+  "dataset_name": "eth_features_v1",
+  "dataset_source": "features",
+  "symbol": "ETHUSDT",
+  "interval": "1s",
+  "feature_version": "v1",
+  "label_mode": "drift",
+  "samples": 86400,
+  "created_at": "2026-03-07",
+  "last_updated": "2026-03-07T12:57:08.967222+00:00",
+  "schema": {
+    "features": [
+      "entropy",
+      "entropy_slope",
+      "spread",
+      "volatility",
+      "volatility_slope",
+      "stability_ratio",
+      "acceleration",
+      "seconds_remaining",
+      "distance_to_boundary",
+      "regime_label"
+    ],
+    "labels": [
+      "persistence_label",
+      "drift_10s_pct"
+    ]
+  }
+}

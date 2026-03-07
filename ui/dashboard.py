@@ -902,46 +902,16 @@ def main() -> None:
     st.session_state["simulation_speed"] = simulation_speed
     st.session_state["chart_update_every_n_steps"] = chart_update_every
 
-    # Placeholders live in main() so they are not recreated when the fragment reruns.
-    # Fragment only updates these in place -> no DOM replace, no flash.
-    controls_ph = st.empty()
-    market_chart_ph = st.empty()
-    metrics_ph = st.empty()
-    learning_charts_ph = st.empty()
-    feature_panel_ph = st.empty()
-    event_log_ph = st.empty()
-    st.session_state["_ph"] = {
-        "controls": controls_ph,
-        "market_chart": market_chart_ph,
-        "metrics": metrics_ph,
-        "learning_charts": learning_charts_ph,
-        "feature_panel": feature_panel_ph,
-        "event_log": event_log_ph,
-    }
-
-    panel = st.session_state.get("dataset_panel", {})
-    with st.container():
-        st.subheader("Dataset Panel")
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("dataset_name", str(panel.get("dataset_name", dataset)))
-        d2.metric("dataset_source", str(panel.get("dataset_source", resolve_dataset_route(dataset).source)))
-        d3.metric("feature_version", str(panel.get("feature_version", "v1")))
-        d4.metric("samples", f"{int(panel.get('samples', 0)):,}")
-        d5.metric("last_updated", str(panel.get("last_updated", "-"))[:19])
-
     delta_sec = max(0.05, _resolve_speed_delay(st.session_state.get("simulation_speed", "10x")))
 
     @st.fragment(run_every=delta_sec)
     def live_simulation_panel():
-        ph = st.session_state.get("_ph")
-        if ph is None:
-            return
         target = int(st.session_state["target_samples"])
         speed = st.session_state.get("simulation_speed", "10x")
         delay = _resolve_speed_delay(speed)
         engine = st.session_state.get("live_engine")
 
-        with ph["controls"].container():
+        with st.container():
             panel = st.session_state.get("dataset_panel", {})
             st.subheader("Dataset Panel")
             d1, d2, d3, d4, d5 = st.columns(5)
@@ -1000,8 +970,7 @@ def main() -> None:
                     panel_data["last_updated"] = datetime.now().isoformat()
                     st.session_state["dataset_panel"] = panel_data
 
-        candles_df = pd.DataFrame(st.session_state["market_candles"])
-        with ph["market_chart"].container():
+            candles_df = pd.DataFrame(st.session_state["market_candles"])
             if not candles_df.empty:
                 fig = go.Figure(
                     data=[go.Candlestick(
@@ -1012,16 +981,17 @@ def main() -> None:
                         close=candles_df["close"],
                     )]
                 )
-                fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
-                st.plotly_chart(fig, use_container_width=True)
+            else:
+                fig = go.Figure()
+            fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
+            st.plotly_chart(fig, use_container_width=True)
 
-        edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
-        spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
-        calibration_value = st.session_state["calibration_history"][-1]["calibration"] if st.session_state["calibration_history"] else 1.0
-        dataset_size = st.session_state["dataset_growth"][-1]["dataset_size"] if st.session_state["dataset_growth"] else 0
-        trade_count = engine.state.latest_metrics.get("trade_count", 0) if engine is not None else 0
+            edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
+            spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
+            calibration_value = st.session_state["calibration_history"][-1]["calibration"] if st.session_state["calibration_history"] else 1.0
+            dataset_size = st.session_state["dataset_growth"][-1]["dataset_size"] if st.session_state["dataset_growth"] else 0
+            trade_count = engine.state.latest_metrics.get("trade_count", 0) if engine is not None else 0
 
-        with ph["metrics"].container():
             st.subheader("Live Learning Metrics")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("edge_score", f"{edge_value:.3f}")
@@ -1030,14 +1000,13 @@ def main() -> None:
             m4.metric("dataset_size", f"{dataset_size:,}")
             m5.metric("trade_count", f"{int(trade_count)}")
 
-        growth = pd.DataFrame(st.session_state["dataset_growth"])
-        edge_hist = pd.DataFrame(st.session_state["edge_history"])
-        spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
-        calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
-        signal_hist = pd.DataFrame(st.session_state["signal_history"])
-        signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
+            growth = pd.DataFrame(st.session_state["dataset_growth"])
+            edge_hist = pd.DataFrame(st.session_state["edge_history"])
+            spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
+            calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
+            signal_hist = pd.DataFrame(st.session_state["signal_history"])
+            signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
 
-        with ph["learning_charts"].container():
             st.subheader("Learning Curves")
             growth_plot = growth.rename(columns={"dataset_size": "y"})[["step", "y"]] if not growth.empty and "dataset_size" in growth.columns else pd.DataFrame({"step": [0], "y": [0.0]})
             st.plotly_chart(_line_fig(growth_plot, "step", "y", "Dataset size", 180), use_container_width=True)
@@ -1075,7 +1044,6 @@ def main() -> None:
                     use_container_width=True,
                 )
 
-        with ph["feature_panel"].container():
             st.subheader("Top Features (latest retrain)")
             feature_df = (
                 pd.DataFrame(st.session_state["feature_importance"], columns=["feature", "importance"])
@@ -1084,7 +1052,6 @@ def main() -> None:
             )
             st.dataframe(feature_df, use_container_width=True, hide_index=True)
 
-        with ph["event_log"].container():
             st.subheader("Event Log")
             st.text("\n".join(st.session_state["event_log"][-60:]))
 

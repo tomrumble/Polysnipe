@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
+from sklearn.exceptions import NotFittedError
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -80,14 +81,20 @@ class PersistenceModel:
 
     def predict_signal(self, features: FeatureVector | dict | pd.DataFrame) -> float:
         payload = self._to_frame(features)
-        if self.is_classifier:
-            return float(self._model.predict_proba(payload)[0, 1])
-        return float(self._model.predict(payload)[0])
+        try:
+            if self.is_classifier:
+                return float(self._model.predict_proba(payload)[0, 1])
+            return float(self._model.predict(payload)[0])
+        except NotFittedError:
+            return 0.5
 
     def predict_signals(self, X: pd.DataFrame) -> np.ndarray:
-        if self.is_classifier:
-            return self._model.predict_proba(X)[:, 1]
-        return self._model.predict(X)
+        try:
+            if self.is_classifier:
+                return self._model.predict_proba(X)[:, 1]
+            return self._model.predict(X)
+        except NotFittedError:
+            return np.full(len(X), 0.5)
 
     def predict_probability(self, features: FeatureVector | dict | pd.DataFrame) -> float:
         warnings.warn("predict_probability() is deprecated; use predict_signal()", DeprecationWarning, stacklevel=2)
