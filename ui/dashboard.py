@@ -67,6 +67,8 @@ class ReplaySimulator:
     DATASET_SEEDS: Dict[str, int] = {
         "btc_binance_api": 17,
         "eth_binance_api": 43,
+        "btc_binance_parquet": 17,
+        "eth_binance_parquet": 43,
         "synthetic": 99,
     }
     API_DATASET_SYMBOLS: Dict[str, str] = {
@@ -207,6 +209,47 @@ class ReplaySimulator:
         }
         return timestamps, path, diagnostics
 
+    def _load_parquet_dataset(
+        self,
+        *,
+        dataset_path: Path,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, Dict[str, float | int | str | bool]]:
+        if not dataset_path.exists():
+            raise RuntimeError(f"Parquet dataset not found: {dataset_path}")
+
+        frame = pd.read_parquet(dataset_path)
+        if frame.empty:
+            raise RuntimeError(f"Parquet dataset is empty: {dataset_path}")
+
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True).dt.tz_localize(None)
+        bounded = frame[(frame["timestamp"] >= start_time) & (frame["timestamp"] < end_time)].copy()
+        if len(bounded) < 24:
+            raise RuntimeError(f"Insufficient candles in parquet dataset for selected range: {dataset_path}")
+
+        price_col = "close" if "close" in bounded.columns else "price"
+        if price_col not in bounded.columns:
+            raise RuntimeError("Parquet dataset must contain a 'close' or 'price' column")
+
+        bounded = bounded.sort_values("timestamp").reset_index(drop=True)
+        timestamps = pd.to_datetime(bounded["timestamp"])
+        path = bounded[price_col].to_numpy(dtype=float)
+
+        expected = max(int((end_time - start_time).total_seconds()), 1)
+        diagnostics: Dict[str, float | int | str | bool] = {
+            "api_source": "parquet",
+            "dataset_loaded": self.dataset,
+            "symbol": resolve_dataset_route(self.dataset).symbol,
+            "interval": "1s",
+            "api_limit_per_request": 0,
+            "api_requests_used": 0,
+            "candles_loaded": int(len(path)),
+            "expected_candles_for_range": expected,
+            "data_truncation_detected": len(path) < int(0.9 * expected),
+        }
+        return timestamps, path, diagnostics
+
     def run(
         self,
         start_time: datetime,
@@ -248,6 +291,15 @@ class ReplaySimulator:
                 dataset_diagnostics["dataset_loaded"] = self.dataset
             except Exception as exc:
                 raise RuntimeError(f"Dataset loader failed: {self.dataset}") from exc
+        elif dataset_loader == "parquet":
+            if not dataset_route.path:
+                raise RuntimeError(f"Missing parquet path for dataset: {dataset_route.dataset_name}")
+            timestamps, path, dataset_diagnostics = self._load_parquet_dataset(
+                dataset_path=_project_root / dataset_route.path,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            n = len(path)
         else:
             timestamps, path, dataset_diagnostics = self._load_synthetic_dataset(
                 rng=rng,
@@ -256,10 +308,10 @@ class ReplaySimulator:
             )
             n = len(path)
 
-        dataset_diagnostics.setdefault("dataset_loaded", self.dataset if dataset_loader == "binance_api" else "synthetic")
-
-        if dataset_diagnostics.get("api_source") == "synthetic" and self.dataset != "synthetic":
-            raise RuntimeError("Dataset mismatch detected")
+        dataset_diagnostics.setdefault(
+            "dataset_loaded",
+            self.dataset if dataset_loader in {"binance_api", "parquet"} else "synthetic",
+        )
 
         telemetry_rows: List[Dict[str, float | int | str]] = []
         trades_rows: List[Dict[str, float | int | str]] = []
