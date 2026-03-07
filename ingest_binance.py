@@ -22,7 +22,7 @@ if str(_root) not in sys.path:
 from src.data import BinanceIngestor
 
 def main() -> None:
-    symbol = (sys.argv[1] or "BTCUSDT").upper()
+    symbol = (sys.argv[1] if len(sys.argv) > 1 else "BTCUSDT").upper()
     hours = int(sys.argv[2]) if len(sys.argv) > 2 else 24
     base_dir = _root / "datasets" / "binance"
     base_dir.mkdir(parents=True, exist_ok=True)

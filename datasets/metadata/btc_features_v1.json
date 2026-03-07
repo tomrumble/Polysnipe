@@ -1,0 +1,10 @@
+{
+  "dataset_name": "btc_features_v1",
+  "dataset_source": "features",
+  "symbol": "BTCUSDT",
+  "interval": "1s",
+  "feature_version": "v1",
+  "label_mode": "drift",
+  "samples": 86400,
+  "last_updated": "2026-03-07T10:52:52.780553+00:00"
+}

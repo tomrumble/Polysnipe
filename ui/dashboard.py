@@ -725,6 +725,17 @@ def _resolve_speed_delay(simulation_speed: str) -> float:
     return delays.get(simulation_speed, 0.06)
 
 
+def _line_fig(df: pd.DataFrame, x: str, y: str, title: str, height: int = 180) -> go.Figure:
+    """Plotly line chart from dataframe; uses single (0,0) point when empty to avoid Vega-Lite extent errors."""
+    if df.empty or y not in df.columns:
+        df = pd.DataFrame({x: [0], y: [0.0]})
+    elif x != "step" and x not in df.columns:
+        df = pd.DataFrame({x: [0], y: [0.0]})
+    fig = go.Figure(go.Scatter(x=df[x], y=df[y], mode="lines"))
+    fig.update_layout(title=title, height=height, margin=dict(t=40, b=30, l=40, r=20))
+    return fig
+
+
 def _init_live_state() -> None:
     defaults = {
         "live_engine": None,
@@ -894,8 +905,8 @@ def main() -> None:
         "event_log": event_log_ph,
     }
 
-    delta_sec = max(0.05, _resolve_speed_delay(st.session_state.get("simulation_speed", "10x")))
-
+    # Fixed interval so changing speed in sidebar does not recreate the fragment (avoids setIn crash).
+    fragment_interval_sec = 0.15
     panel = st.session_state.get("dataset_panel", {})
     with st.container():
         st.subheader("Dataset Panel")
@@ -906,7 +917,7 @@ def main() -> None:
         d4.metric("samples", f"{int(panel.get('samples', 0)):,}")
         d5.metric("last_updated", str(panel.get("last_updated", "-"))[:19])
 
-    @st.fragment(run_every=delta_sec)
+    @st.fragment(run_every=fragment_interval_sec)
     def live_simulation_panel():
         ph = st.session_state.get("_ph")
         if not ph:
@@ -914,6 +925,7 @@ def main() -> None:
         target = int(st.session_state["target_samples"])
         speed = st.session_state.get("simulation_speed", "10x")
         chart_every = st.session_state.get("chart_update_every_n_steps", 25)
+        delay = _resolve_speed_delay(speed)
 
         with ph["controls"].container():
             c1, c2, c3, c4 = st.columns(4)
@@ -925,8 +937,9 @@ def main() -> None:
         engine = st.session_state.get("live_engine")
         if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target:
             engine.start()
-
-            steps_per_refresh = 1 if speed in {"1x", "5x"} else 5
+            # Steps per fragment tick: faster speed = more steps per tick (delay is lower for faster speeds).
+            steps_per_refresh = max(1, int(0.2 / max(0.01, delay))) if delay > 0 else 20
+            steps_per_refresh = min(steps_per_refresh, 20)
             for _ in range(steps_per_refresh):
                 if st.session_state["processed_steps"] >= target:
                     st.session_state["running"] = False
@@ -978,7 +991,10 @@ def main() -> None:
                 )]
             )
             fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
-            ph["market_chart"].plotly_chart(fig, use_container_width=True)
+        else:
+            fig = go.Figure()
+            fig.update_layout(title="Market Replay (Rolling 200 Candles)", height=320)
+        ph["market_chart"].plotly_chart(fig, use_container_width=True)
 
         edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
         spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
@@ -995,54 +1011,49 @@ def main() -> None:
             m4.metric("dataset_size", f"{dataset_size:,}")
             m5.metric("trade_count", f"{int(trade_count)}")
 
-        if st.session_state["processed_steps"] % chart_every == 0 or not st.session_state["running"]:
-            growth = pd.DataFrame(st.session_state["dataset_growth"])
-            edge_hist = pd.DataFrame(st.session_state["edge_history"])
-            spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
-            calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
-            signal_hist = pd.DataFrame(st.session_state["signal_history"])
-            signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
-            with ph["learning_charts"].container():
-                st.subheader("Learning Curves")
-                if not growth.empty:
-                    st.line_chart(growth.set_index("step")["dataset_size"], height=180)
-                c1, c2, c3 = st.columns(3)
-                if not edge_hist.empty:
-                    c1.line_chart(edge_hist.set_index("step")["edge_score"], height=180)
-                if not spearman_hist.empty:
-                    c2.line_chart(spearman_hist.set_index("step")["spearman"], height=180)
-                if not calibration_hist.empty:
-                    c3.line_chart(calibration_hist.set_index("step")["calibration"], height=180)
-
-                s1, s2 = st.columns(2)
-                if not signal_hist.empty:
-                    s1.plotly_chart(
-                        px.histogram(
-                            signal_hist,
-                            x="predicted_signal",
-                            nbins=30,
-                            title="Predicted Signal Distribution",
-                        ),
-                        use_container_width=True,
-                    )
-                if not signal_outcomes.empty:
-                    binned = signal_outcomes.copy()
-                    binned["signal_bucket"] = pd.cut(
-                        binned["predicted_signal"],
-                        bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.00001],
-                        labels=["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
-                        include_lowest=True,
-                    )
-                    relation = (
-                        binned.groupby("signal_bucket", observed=False)["outcome"]
-                        .mean()
-                        .reset_index()
-                        .rename(columns={"outcome": "success_rate"})
-                    )
-                    s2.plotly_chart(
-                        px.bar(relation, x="signal_bucket", y="success_rate", title="Predicted Signal vs Outcome"),
-                        use_container_width=True,
-                    )
+        growth = pd.DataFrame(st.session_state["dataset_growth"])
+        edge_hist = pd.DataFrame(st.session_state["edge_history"])
+        spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
+        calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
+        signal_hist = pd.DataFrame(st.session_state["signal_history"])
+        signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
+        with ph["learning_charts"].container():
+            st.subheader("Learning Curves")
+            growth_plot = growth.rename(columns={"dataset_size": "y"})[["step", "y"]] if not growth.empty and "dataset_size" in growth.columns else pd.DataFrame({"step": [0], "y": [0.0]})
+            st.plotly_chart(_line_fig(growth_plot, "step", "y", "Dataset size", 180), use_container_width=True)
+            c1, c2, c3 = st.columns(3)
+            c1.plotly_chart(_line_fig(edge_hist, "step", "edge_score", "Edge score", 180), use_container_width=True)
+            c2.plotly_chart(_line_fig(spearman_hist, "step", "spearman", "Spearman", 180), use_container_width=True)
+            c3.plotly_chart(_line_fig(calibration_hist, "step", "calibration", "Calibration error", 180), use_container_width=True)
+            s1, s2 = st.columns(2)
+            sig_hist = signal_hist if not signal_hist.empty else pd.DataFrame({"predicted_signal": [0.0]})
+            s1.plotly_chart(
+                px.histogram(sig_hist, x="predicted_signal", nbins=30, title="Predicted Signal Distribution"),
+                use_container_width=True,
+            )
+            if not signal_outcomes.empty:
+                binned = signal_outcomes.copy()
+                binned["signal_bucket"] = pd.cut(
+                    binned["predicted_signal"],
+                    bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.00001],
+                    labels=["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
+                    include_lowest=True,
+                )
+                relation = (
+                    binned.groupby("signal_bucket", observed=False)["outcome"]
+                    .mean()
+                    .reset_index()
+                    .rename(columns={"outcome": "success_rate"})
+                )
+                s2.plotly_chart(
+                    px.bar(relation, x="signal_bucket", y="success_rate", title="Predicted Signal vs Outcome"),
+                    use_container_width=True,
+                )
+            else:
+                s2.plotly_chart(
+                    px.bar(pd.DataFrame({"signal_bucket": ["0.0-0.2"], "success_rate": [0.0]}), x="signal_bucket", y="success_rate", title="Predicted Signal vs Outcome"),
+                    use_container_width=True,
+                )
 
         with ph["feature_panel"].container():
             st.subheader("Top Features (latest retrain)")
