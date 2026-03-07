@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sys
 
 import pandas as pd
@@ -60,9 +61,37 @@ def test_dataset_builder(tmp_path: Path):
     assert ds_path.exists()
     assert "return" in data.columns
     assert data["return"].nunique() > 1
+    assert {"persistence_label", "short_move_label", "drift_10s_pct", "timestamp"}.issubset(data.columns)
+
     X, y, meta = dataset_to_matrices(data)
     assert not X.empty
     assert len(y) == len(meta)
+
+    _, y_short, _ = dataset_to_matrices(data, label_mode="short_move")
+    _, y_drift, _ = dataset_to_matrices(data, label_mode="drift")
+    assert y_short.dtype.kind in {"i", "u"}
+    assert y_drift.dtype.kind == "f"
+
+
+
+
+def test_dataset_builder_label_mode_routing(tmp_path: Path):
+    telemetry = sample_telemetry()
+
+    persistence_data = build_edge_dataset(telemetry, dataset_path=tmp_path / "edge_p.parquet", append=False, label_mode="persistence")
+    short_data = build_edge_dataset(telemetry, dataset_path=tmp_path / "edge_s.parquet", append=False, label_mode="short_move")
+    drift_data = build_edge_dataset(telemetry, dataset_path=tmp_path / "edge_d.parquet", append=False, label_mode="drift")
+
+    persistence_meta = persistence_data["metadata"].map(json.loads)
+    short_meta = short_data["metadata"].map(json.loads)
+    drift_meta = drift_data["metadata"].map(json.loads)
+
+    assert all(isinstance(row["target"], int) for row in persistence_meta)
+    assert all(isinstance(row["target"], int) for row in short_meta)
+    assert all(isinstance(row["target"], float) for row in drift_meta)
+    assert all(row["label_mode"] == "persistence" for row in persistence_meta)
+    assert all(row["label_mode"] == "short_move" for row in short_meta)
+    assert all(row["label_mode"] == "drift" for row in drift_meta)
 
 
 def test_model_training_and_probability(tmp_path: Path):
