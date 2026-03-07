@@ -938,8 +938,8 @@ def main() -> None:
             return
         target = int(st.session_state["target_samples"])
         speed = st.session_state.get("simulation_speed", "10x")
-        chart_every = st.session_state.get("chart_update_every_n_steps", 25)
         delay = _resolve_speed_delay(speed)
+        engine = st.session_state.get("live_engine")
 
         with ph.container():
             panel = st.session_state.get("dataset_panel", {})
@@ -957,7 +957,6 @@ def main() -> None:
             c3.metric("Simulation Speed", speed)
             c4.metric("Runtime", "RUNNING" if st.session_state["running"] else "PAUSED")
 
-            engine = st.session_state.get("live_engine")
             if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target:
                 engine.start()
                 steps_per_refresh = max(1, int(0.2 / max(0.01, delay))) if delay > 0 else 20
@@ -987,25 +986,6 @@ def main() -> None:
                     )
                     st.session_state["feature_importance"] = snapshot.feature_importance
 
-                panel_data = st.session_state.get("dataset_panel", {})
-                panel_data["samples"] = int(max(panel_data.get("samples", 0), snapshot.dataset_size))
-                panel_data["last_updated"] = datetime.now().isoformat()
-                st.session_state["dataset_panel"] = panel_data
-
-        candles_df = pd.DataFrame(st.session_state["market_candles"])
-        if not candles_df.empty:
-            fig = go.Figure(
-                data=[go.Candlestick(
-                    x=pd.to_datetime(candles_df["timestamp"]),
-                    open=candles_df["open"],
-                    high=candles_df["high"],
-                    low=candles_df["low"],
-                    close=candles_df["close"],
-                )]
-            )
-            fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
-            ph["market_chart"].plotly_chart(fig, use_container_width=True)
-
                     _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
                     _push_event(f"Feature vector generated: {snapshot.feature_vector}")
                     if snapshot.trade_executed:
@@ -1014,12 +994,11 @@ def main() -> None:
                         _push_event(
                             f"Step {snapshot.step_index}: Retraining model | Edge={snapshot.edge_score:.3f} Spearman={snapshot.spearman_rank_correlation:.3f}"
                         )
-                        st.session_state["feature_importance"] = snapshot.feature_importance
 
-                    panel = st.session_state.get("dataset_panel", {})
-                    panel["samples"] = int(max(panel.get("samples", 0), snapshot.dataset_size))
-                    panel["last_updated"] = datetime.now().isoformat()
-                    st.session_state["dataset_panel"] = panel
+                    panel_data = st.session_state.get("dataset_panel", {})
+                    panel_data["samples"] = int(max(panel_data.get("samples", 0), snapshot.dataset_size))
+                    panel_data["last_updated"] = datetime.now().isoformat()
+                    st.session_state["dataset_panel"] = panel_data
 
             candles_df = pd.DataFrame(st.session_state["market_candles"])
             if not candles_df.empty:
@@ -1033,10 +1012,7 @@ def main() -> None:
                     )]
                 )
                 fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
-            else:
-                fig = go.Figure()
-                fig.update_layout(title="Market Replay (Rolling 200 Candles)", height=320)
-            st.plotly_chart(fig, use_container_width=True)
+                ph["market_chart"].plotly_chart(fig, use_container_width=True)
 
             edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
             spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
