@@ -21,7 +21,11 @@ import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
 from src.data import DatasetDiagnostics, fetch_binance_klines_paginated, resolve_dataset_route
-from src.persistence_model import PersistenceInputs, PersistenceModel
+from src.persistence_model import PersistenceInputs, PersistenceModel as DiffusionPersistenceModel
+from src.edge.model import PersistenceModel
+from src.edge.pipeline import run_edge_pipeline
+from src.edge.policy import TradingPolicy
+from src.features import extract_features
 from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
     SignalConfig,
@@ -68,7 +72,12 @@ class ReplaySimulator:
         self.signal_config = signal_config
         self.api_limit = api_limit
         self.entropy_window = entropy_window
-        self.model = PersistenceModel(center=1.0, slope=1.7, mode=persistence_mode)
+        self.diffusion_model = DiffusionPersistenceModel(center=1.0, slope=1.7, mode=persistence_mode)
+        self.edge_model: PersistenceModel | None = None
+        self.policy = TradingPolicy()
+        latest_model = Path("models/latest_persistence_model.pkl")
+        if latest_model.exists():
+            self.edge_model = PersistenceModel.load(latest_model)
 
     @classmethod
     def _cache_path(cls, symbol: str, limit: int, start_time: datetime, end_time: datetime) -> Path:
@@ -253,7 +262,7 @@ class ReplaySimulator:
             now_ts = timestamps[i].timestamp()
             expiry_ts = timestamps[expiry_idx].timestamp()
 
-            out = self.model.compute(
+            out = self.diffusion_model.compute(
                 PersistenceInputs(
                     current_price=current_price,
                     boundary_price=boundary_price,
@@ -295,20 +304,38 @@ class ReplaySimulator:
                 self.signal_config,
             )
 
+            observation = {
+                "directional_entropy": entropy_value,
+                "entropy_velocity": entropy_velocity,
+                "spread": spread,
+                "volatility": out.volatility,
+                "volatility_slope": out.volatility - last_volatility,
+                "stability_ratio": out.stability_ratio,
+                "price_acceleration": accel,
+                "seconds_remaining": seconds_remaining,
+                "distance_to_boundary_at_entry": out.distance_to_boundary,
+                "regime_label": regime.value,
+            }
+            features = extract_features(observation)
+            model_probability = out.persistence_probability
+            if self.edge_model is not None:
+                model_probability = self.edge_model.predict_probability(features)
+            policy_decision = self.policy.evaluate(model_probability)
+
             guard_accel_fail = self.heuristic_guards["acceleration_veto"] and abs(accel) > 3.5
             guard_spread_fail = self.heuristic_guards["spread_veto"] and spread > 0.22
             guard_vol_fail = self.heuristic_guards["volatility_spike_veto"] and out.volatility > base_vol * 1.8
             guard_osc_fail = self.heuristic_guards["oscillation_veto"] and np.sign(path[i] - path[i - 1]) != np.sign(path[i - 1] - path[i - 2])
             heuristic_blocked = guard_accel_fail or guard_spread_fail or guard_vol_fail or guard_osc_fail
 
-            should_trade = strict_decision.should_trade and not heuristic_blocked
-            veto_reason = strict_decision.veto_reason
-            if not strict_decision.should_trade:
-                veto_reason = strict_decision.veto_reason
+            should_trade = policy_decision.enter and not heuristic_blocked
+            veto_reason = ""
+            if not policy_decision.enter:
+                veto_reason = "policy_threshold"
             elif heuristic_blocked:
                 veto_reason = "heuristic_guard"
 
-            signal_reason = strict_decision.signal_reason if should_trade else "none"
+            signal_reason = "model_persistence_policy" if should_trade else "none"
 
             future_path = path[i + 1 : expiry_idx + 1]
             max_price_until_expiry = float(np.max(future_path)) if len(future_path) else current_price
@@ -356,7 +383,7 @@ class ReplaySimulator:
                 "spread": spread,
                 "spread_at_entry": spread,
                 "price_acceleration": accel,
-                "persistence_probability": out.persistence_probability,
+                "persistence_probability": model_probability,
                 "regime_label": regime.value,
                 "signal_reason": signal_reason,
                 "veto_reason": veto_reason,
@@ -517,6 +544,7 @@ def main() -> None:
         "volatility_spike_veto": st.sidebar.checkbox("volatility_spike_veto", value=True),
     }
 
+    autopilot = st.sidebar.toggle("Autopilot Edge Discovery", value=False)
     run_clicked = st.sidebar.button("Run Simulation", type="primary")
 
     if "sim_outputs" not in st.session_state:
@@ -553,6 +581,28 @@ def main() -> None:
                 total_capital=total_capital,
             )
             st.session_state["run_error"] = ""
+            if autopilot:
+                pipeline_result = run_edge_pipeline(st.session_state["sim_outputs"].telemetry)
+                st.session_state["pipeline_result"] = pipeline_result
+                rerun_simulator = ReplaySimulator(
+                    dataset=dataset,
+                    heuristic_guards=heuristics,
+                    signal_config=SignalConfig(
+                        stability_ratio_threshold=stability_ratio_threshold,
+                        entropy_threshold=entropy_threshold,
+                        accel_threshold=accel_threshold,
+                        spread_threshold=spread_threshold,
+                        evaluation_window_seconds=60.0,
+                    ),
+                    api_limit=int(api_limit),
+                    persistence_mode=persistence_mode,
+                )
+                st.session_state["sim_outputs"] = rerun_simulator.run(
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    stream_count=stream_count,
+                    total_capital=total_capital,
+                )
             st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
             st.session_state["last_simulation_config"] = {
                 "dataset": dataset,
@@ -627,6 +677,44 @@ def main() -> None:
         for feature in ["directional_entropy", "volatility", "spread"]:
             chart_df = _success_vs_feature(traded, feature)
             st.plotly_chart(px.line(chart_df, x="bucket", y="success_rate", title=f"{feature} vs success_rate"), use_container_width=True)
+
+    st.header("Model Performance")
+    metrics_path = Path("models/model_metrics.json")
+    if metrics_path.exists():
+        model_metrics = json.loads(metrics_path.read_text())
+        v = model_metrics.get("validation", {})
+        t = model_metrics.get("test", {})
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Validation ROC-AUC", f"{v.get('roc_auc', 0.0):.3f}")
+        c2.metric("Validation Precision/Recall", f"{v.get('precision', 0.0):.3f}/{v.get('recall', 0.0):.3f}")
+        c3.metric("Test Win Rate", f"{t.get('win_rate', 0.0):.3f}")
+
+        threshold_df = pd.DataFrame(
+            {
+                "threshold": [0.8, 0.85, 0.9, 0.95, 0.97, 0.99],
+                "win_rate": [
+                    float((telemetry[telemetry["persistence_probability"] >= th]["trade_outcome"] == "WIN").mean())
+                    if not telemetry[telemetry["persistence_probability"] >= th].empty
+                    else 0.0
+                    for th in [0.8, 0.85, 0.9, 0.95, 0.97, 0.99]
+                ],
+            }
+        )
+        st.plotly_chart(px.line(threshold_df, x="threshold", y="win_rate", title="Win rate vs probability threshold"), use_container_width=True)
+
+    latest_model = Path("models/latest_persistence_model.pkl")
+    if latest_model.exists() and not telemetry.empty:
+        edge_model = PersistenceModel.load(latest_model)
+        names = ["entropy", "entropy_slope", "spread", "volatility", "volatility_slope", "stability_ratio", "acceleration", "seconds_remaining", "distance_to_boundary", "regime"]
+        imps = edge_model.feature_importance_
+        if imps is not None:
+            fi = pd.DataFrame({"feature": names, "importance": imps})
+            st.plotly_chart(px.bar(fi.sort_values("importance", ascending=False), x="feature", y="importance", title="Feature Importance"), use_container_width=True)
+
+    diag_path = Path("datasets/diagnostics/entropy_vs_volatility_heatmap.html")
+    if diag_path.exists():
+        st.subheader("Edge Surface")
+        st.components.v1.html(diag_path.read_text(), height=500, scrolling=True)
 
     st.header("Trade Telemetry")
     st.dataframe(telemetry, use_container_width=True, height=340)
