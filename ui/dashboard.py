@@ -6,6 +6,7 @@ Run with:
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
 from src.data import fetch_binance_klines_paginated, resolve_dataset_route
@@ -443,7 +445,9 @@ def _trade_table(telemetry: pd.DataFrame) -> pd.DataFrame:
 def _calibration_frame(traded: pd.DataFrame) -> tuple[pd.DataFrame, float]:
     if traded.empty:
         return pd.DataFrame(columns=["bucket", "predicted_probability_mean", "actual_persistence_rate", "count"]), 1.0
-    frame = traded[["persistence_probability", "outcome"]].copy()
+    frame = traded[["persistence_probability", "outcome"]].dropna().copy()
+    if frame.empty:
+        return pd.DataFrame(columns=["bucket", "predicted_probability_mean", "actual_persistence_rate", "count"]), 1.0
     frame["bucket"] = pd.cut(frame["persistence_probability"], bins=CALIBRATION_BINS, labels=CALIBRATION_LABELS, include_lowest=True, right=False)
     summary = frame.groupby("bucket", observed=False).agg(
         predicted_probability_mean=("persistence_probability", "mean"),
@@ -458,13 +462,20 @@ def _calibration_frame(traded: pd.DataFrame) -> tuple[pd.DataFrame, float]:
 def _ranking_frame(traded: pd.DataFrame) -> tuple[pd.DataFrame, float]:
     if traded.empty:
         return pd.DataFrame(columns=["probability_bucket", "trade_count", "win_rate"]), 0.0
-    frame = traded[["persistence_probability", "outcome"]].copy()
+    frame = traded[["persistence_probability", "outcome"]].dropna().copy()
+    if frame.empty:
+        return pd.DataFrame(columns=["probability_bucket", "trade_count", "win_rate"]), 0.0
     frame["probability_bucket"] = pd.cut(frame["persistence_probability"], bins=RANKING_BINS, labels=RANKING_LABELS, include_lowest=True, right=False)
     summary = frame.groupby("probability_bucket", observed=False).agg(
         trade_count=("outcome", "count"),
         win_rate=("outcome", "mean"),
     ).reset_index()
-    spearman = float(frame["persistence_probability"].corr(frame["outcome"], method="spearman")) if len(frame) > 1 else 0.0
+    # Avoid ConstantInputWarning: correlation undefined when either series is constant
+    if len(frame) < 2 or frame["persistence_probability"].nunique() < 2 or frame["outcome"].nunique() < 2:
+        spearman = 0.0
+    else:
+        r = frame["persistence_probability"].corr(frame["outcome"], method="spearman")
+        spearman = 0.0 if pd.isna(r) else float(r)
     return summary, spearman
 
 
@@ -500,6 +511,54 @@ def _profitability_metrics(traded: pd.DataFrame, transaction_cost: float) -> tup
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
     }, frame[["timestamp", "equity", "net_return"]]
+
+
+def _edge_validation_metrics_text(
+    edge_status: str,
+    edge_score: float,
+    calibration_error: float,
+    spearman: float,
+    profitability: dict[str, float],
+    stability_df: pd.DataFrame,
+    config: dict,
+) -> str:
+    """Build a compact edge validation metrics string suitable for clipboard."""
+    lines = [
+        "EDGE VALIDATION METRICS",
+        "=======================",
+        "",
+        f"edge_status: {edge_status}",
+        f"edge_score: {edge_score:.3f}",
+        "",
+        "Calibration",
+        "-----------",
+        f"calibration_error: {calibration_error:.3f}",
+        "",
+        "Ranking",
+        "--------",
+        f"spearman_rank_correlation: {spearman:.3f}",
+        "",
+        "Profitability",
+        "-------------",
+        f"total_trades: {int(profitability['total_trades'])}",
+        f"win_rate: {profitability['win_rate'] * 100:.2f}%",
+        f"avg_return_pct: {profitability['avg_return'] * 100:.3f}%",
+        f"expected_value_pct: {profitability['expected_value'] * 100:.3f}%",
+        f"max_drawdown_pct: {profitability['max_drawdown'] * 100:.2f}%",
+        f"sharpe_ratio: {profitability['sharpe']:.3f}",
+    ]
+    if not stability_df.empty:
+        lines.extend(["", "Stability (last N trades)", "----------------------"])
+        for _, row in stability_df.iterrows():
+            lines.append(
+                f"{row['window']}: trades={int(row['trades'])}, win_rate={row['win_rate']:.2f}, "
+                f"expected_value={row['expected_value']:.4f}, drawdown={row['drawdown']:.4f}"
+            )
+    lines.extend(["", "Config (run)", "------------"])
+    for key in ("dataset", "start", "end", "stream_count", "total_capital", "transaction_cost"):
+        if key in config:
+            lines.append(f"{key}: {config[key]}")
+    return "\n".join(lines)
 
 
 def _window_stability(trade_curve: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
@@ -707,6 +766,50 @@ def main() -> None:
         px.bar(gauge, x=["Edge Score"], y="edge_score", range_y=[0, 1], title=f"Edge Score Gauge: {edge_score:.2f}"),
         use_container_width=True,
     )
+
+    run_config = st.session_state.get("last_simulation_config", {})
+    run_config.setdefault("transaction_cost", transaction_cost)
+    metrics_text = _edge_validation_metrics_text(
+        edge_status=edge_status,
+        edge_score=edge_score,
+        calibration_error=calibration_error,
+        spearman=spearman,
+        profitability=profitability,
+        stability_df=stability_df,
+        config=run_config,
+    )
+    metrics_b64 = base64.b64encode(metrics_text.encode()).decode()
+    payload_attr = metrics_b64.replace("&", "&amp;").replace('"', "&quot;")
+    copy_html = f"""
+    <div id="edge-metrics-b64" data-payload="{payload_attr}"></div>
+    <button id="copy-edge-metrics" style="
+        padding: 0.4rem 0.8rem;
+        font-size: 0.9rem;
+        cursor: pointer;
+        border-radius: 0.35rem;
+        border: 1px solid #ccc;
+        background: #f0f2f6;
+    ">Copy edge validation metrics</button>
+    <span id="copy-feedback" style="margin-left: 0.5rem; font-size: 0.9rem; color: #0f9d58;"></span>
+    <script>
+    (function() {{
+        var el = document.getElementById('edge-metrics-b64');
+        var b64 = el && el.getAttribute('data-payload') || '';
+        var text = b64 ? atob(b64) : '';
+        var btn = document.getElementById('copy-edge-metrics');
+        var feedback = document.getElementById('copy-feedback');
+        if (btn && text) {{
+            btn.onclick = function() {{
+                navigator.clipboard.writeText(text).then(function() {{
+                    feedback.textContent = 'Copied!';
+                    setTimeout(function() {{ feedback.textContent = ''; }}, 2000);
+                }});
+            }};
+        }}
+    }})();
+    </script>
+    """
+    components.html(copy_html, height=50)
 
     st.subheader("Model Calibration")
     st.metric("Calibration Error (mean absolute gap)", f"{calibration_error:.3f}")
