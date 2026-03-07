@@ -71,12 +71,21 @@ class ReplaySimulator:
         self.model = PersistenceModel(center=1.0, slope=1.7, mode=persistence_mode)
 
     @classmethod
-    def _cache_path(cls, symbol: str, limit: int) -> Path:
-        return cls.CACHE_DIR / f"{symbol.lower()}_1s_{limit}.csv"
+    def _cache_path(cls, symbol: str, limit: int, start_time: datetime, end_time: datetime) -> Path:
+        start_token = start_time.strftime("%Y%m%dT%H%M%S")
+        end_token = end_time.strftime("%Y%m%dT%H%M%S")
+        return cls.CACHE_DIR / f"{symbol.lower()}_1s_{start_token}_{end_token}_{limit}.csv"
 
     @classmethod
-    def _load_cached_binance_prices(cls, symbol: str, limit: int) -> pd.DataFrame:
-        cache_path = cls._cache_path(symbol, limit)
+    def _load_cached_binance_prices(
+        cls,
+        *,
+        symbol: str,
+        limit: int,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> pd.DataFrame:
+        cache_path = cls._cache_path(symbol, limit, start_time, end_time)
         if not cache_path.exists():
             return pd.DataFrame(columns=["timestamp", "price"])
 
@@ -85,6 +94,7 @@ class ReplaySimulator:
             return pd.DataFrame(columns=["timestamp", "price"])
 
         cached["timestamp"] = pd.to_datetime(cached["timestamp"])
+        cached = cached[(cached["timestamp"] >= start_time) & (cached["timestamp"] < end_time)].copy()
         return cached[["timestamp", "price"]]
 
     @classmethod
@@ -95,7 +105,7 @@ class ReplaySimulator:
         end_time: datetime,
         limit: int,
     ) -> tuple[pd.DataFrame, Dict[str, float | int | str | bool]]:
-        cached = cls._load_cached_binance_prices(symbol=symbol, limit=limit)
+        cached = cls._load_cached_binance_prices(symbol=symbol, limit=limit, start_time=start_time, end_time=end_time)
         if not cached.empty:
             expected = max(int((end_time - start_time).total_seconds()), 1)
             diagnostics = {
@@ -123,7 +133,7 @@ class ReplaySimulator:
             return frame, diagnostics_obj.__dict__
 
         cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        frame.to_csv(cls._cache_path(symbol=symbol, limit=limit), index=False)
+        frame.to_csv(cls._cache_path(symbol=symbol, limit=limit, start_time=start_time, end_time=end_time), index=False)
         return frame, diagnostics_obj.__dict__
 
     def _load_binance_dataset(
@@ -498,7 +508,6 @@ def main() -> None:
     entropy_threshold = st.sidebar.slider("entropy_threshold", min_value=0.05, max_value=0.69, value=0.62, step=0.01)
     accel_threshold = st.sidebar.slider("accel_threshold", min_value=0.05, max_value=2.0, value=0.45, step=0.05)
     spread_threshold = st.sidebar.slider("spread_threshold", min_value=0.005, max_value=0.05, value=0.02, step=0.001)
-    seconds_threshold = st.sidebar.slider("seconds_remaining_threshold", min_value=5.0, max_value=30.0, value=15.0, step=1.0)
 
     st.sidebar.subheader("heuristic guard toggles")
     heuristics = {
@@ -531,7 +540,7 @@ def main() -> None:
                 entropy_threshold=entropy_threshold,
                 accel_threshold=accel_threshold,
                 spread_threshold=spread_threshold,
-                seconds_remaining_threshold=seconds_threshold,
+                evaluation_window_seconds=60.0,
             ),
             api_limit=int(api_limit),
             persistence_mode=persistence_mode,

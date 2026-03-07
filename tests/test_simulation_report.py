@@ -107,7 +107,7 @@ def test_generate_simulation_report_with_trades_and_new_diagnostics():
             "entropy_threshold": 0.62,
             "accel_threshold": 0.45,
             "spread_threshold": 0.02,
-            "seconds_remaining_threshold": 30,
+            "evaluation_window_seconds": 60,
             "acceleration_veto": True,
             "oscillation_veto": True,
             "spread_veto": True,
@@ -132,6 +132,9 @@ def test_generate_simulation_report_with_trades_and_new_diagnostics():
     assert "interval: 1s" in report
     assert "DATASET DIAGNOSTICS" in report
     assert "api_limit_per_request: 1000" in report
+    assert "LOADED DATA TOTALS" in report
+    assert "candles_loaded_total: 2200" in report
+    assert "api_requests_used_total: 2" in report
 
 
 def test_generate_simulation_report_warning_when_no_collapse_signals():

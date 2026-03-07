@@ -24,7 +24,7 @@ class SignalConfig:
     entropy_threshold: float = 0.62
     accel_threshold: float = 0.45
     spread_threshold: float = 0.02
-    seconds_remaining_threshold: float = 15.0
+    evaluation_window_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -100,8 +100,10 @@ def classify_regime(
 def evaluate_signal(inputs: SignalInputs, config: SignalConfig) -> SignalDecision:
     """Apply state-collapse entry rules and strict veto guards with diagnostics."""
 
-    if inputs.seconds_remaining >= config.seconds_remaining_threshold:
-        return SignalDecision(False, "none", "time_guard", "")
+    if inputs.seconds_remaining >= config.evaluation_window_seconds:
+        return SignalDecision(False, "none", "outside_eval_window", "")
+
+    urgency = max(0.0, min(1.0, (config.evaluation_window_seconds - inputs.seconds_remaining) / config.evaluation_window_seconds))
 
     collapse_decision = evaluate_collapse_stage(
         CollapseInputs(
@@ -114,10 +116,10 @@ def evaluate_signal(inputs: SignalInputs, config: SignalConfig) -> SignalDecisio
             volatility_previous=inputs.volatility_previous,
             regime_label=inputs.regime_label,
         ),
-        entropy_threshold=config.entropy_threshold,
-        spread_threshold=config.spread_threshold,
-        accel_threshold=config.accel_threshold,
-        stability_ratio_threshold=config.stability_ratio_threshold,
+        entropy_threshold=max(0.0, config.entropy_threshold - 0.08 * urgency),
+        spread_threshold=max(0.001, config.spread_threshold * (1.0 - 0.35 * urgency)),
+        accel_threshold=max(0.05, config.accel_threshold * (1.0 - 0.25 * urgency)),
+        stability_ratio_threshold=config.stability_ratio_threshold * (1.0 + 0.4 * urgency),
     )
 
     if not collapse_decision.passed:

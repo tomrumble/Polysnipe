@@ -19,7 +19,6 @@ VETO_ORDER = [
     "spread_guard",
     "acceleration_guard",
     "stability_guard",
-    "time_guard",
 ]
 
 COLLAPSE_BLOCKER_ORDER = [
@@ -177,7 +176,7 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
         f"entropy_threshold: {float(config.get('entropy_threshold', 0.0)):.2f}",
         f"accel_threshold: {float(config.get('accel_threshold', 0.0)):.2f}",
         f"spread_threshold: {float(config.get('spread_threshold', 0.0)):.2f}",
-        f"seconds_remaining_threshold: {int(config.get('seconds_remaining_threshold', 0))}",
+        f"evaluation_window_seconds: {int(config.get('evaluation_window_seconds', 60))}",
         "",
         "HEURISTIC GUARDS",
         "----------------",
@@ -294,6 +293,12 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
             f"candles_loaded: {dataset_diagnostics.get('candles_loaded', '')}",
             f"expected_candles_for_range: {dataset_diagnostics.get('expected_candles_for_range', '')}",
             f"data_truncation_detected: {str(bool(dataset_diagnostics.get('data_truncation_detected', False))).lower()}",
+            "",
+            "LOADED DATA TOTALS",
+            "------------------",
+            f"candles_loaded_total: {dataset_diagnostics.get('candles_loaded', '')}",
+            f"expected_candles_total: {dataset_diagnostics.get('expected_candles_for_range', '')}",
+            f"api_requests_used_total: {dataset_diagnostics.get('api_requests_used', '')}",
             "",
             "SIMULATION WARNINGS",
             "-------------------",
