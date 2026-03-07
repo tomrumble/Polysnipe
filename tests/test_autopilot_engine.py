@@ -92,3 +92,65 @@ def test_market_tape_and_research_engine_loop(tmp_path: Path):
 
     assert state.observations_seen == 120
     assert Path("datasets/edge_training_data.parquet").exists()
+
+
+def test_training_engine_runtime_states_and_intervals(tmp_path: Path):
+    market = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=40, freq="s", tz="UTC"),
+            "close": [100 + i * 0.01 for i in range(40)],
+            "entry_price": [100.0] * 40,
+            "boundary_price": [101.0] * 40,
+            "directional_entropy": [0.2] * 40,
+            "entropy_velocity": [0.0] * 40,
+            "spread": [0.01] * 40,
+            "volatility": [0.03] * 40,
+            "volatility_slope": [0.0] * 40,
+            "stability_ratio": [2.0] * 40,
+            "price_acceleration": [0.0] * 40,
+            "seconds_remaining": [10] * 40,
+            "distance_to_boundary": [1.0] * 40,
+            "regime_label": ["PERSISTENT_COMPRESSION"] * 40,
+            "symbol": ["BTCUSDT"] * 40,
+        }
+    )
+    tape_path = tmp_path / "runtime_tape.parquet"
+    market.to_parquet(tape_path, index=False)
+
+    dataset_path = tmp_path / "edge_training_data.parquet"
+    builder = EdgeDatasetBuilder(dataset_path=dataset_path)
+    tape = MarketTape(tape_path)
+    engine = TrainingEngine(
+        tape=tape,
+        dataset_builder=builder,
+        retrain_interval=10,
+        metric_interval=5,
+        horizon_ticks=5,
+        poll_interval_seconds=0.0,
+    )
+
+    retrain_calls = {"n": 0}
+
+    def fake_retrain() -> None:
+        retrain_calls["n"] += 1
+
+    engine._maybe_retrain = fake_retrain  # type: ignore[method-assign]
+
+    paused_state = engine.run(max_iterations=2)
+    assert paused_state.runtime_state == RuntimeState.PAUSED
+    assert paused_state.dataset_size == 0
+
+    engine.start()
+    running_state = engine.run(max_iterations=15)
+    assert running_state.observations_seen == 15
+    assert running_state.dataset_size == 15
+    assert retrain_calls["n"] == 1
+    assert running_state.latest_metrics.get("dataset_size") == 15
+
+    engine.pause()
+    paused_again = engine.run(max_iterations=1)
+    assert paused_again.dataset_size == 15
+
+    engine.stop()
+    stopped = engine.run(max_iterations=1)
+    assert stopped.runtime_state == RuntimeState.STOPPED
