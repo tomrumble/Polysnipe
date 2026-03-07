@@ -220,16 +220,30 @@ class TrainingEngine:
             f"features={len(FEATURE_COLUMNS)}"
         )
         if len(data) < 100:
+            print("[RETRAIN] skipped: dataset < 100 rows")
             return False
 
         split = chronological_split(data)
-        if split.validation.empty or split.test.empty:
+        if split.validation.empty:
+            print("[RETRAIN] skipped: validation split empty")
+            return False
+
+        if split.test.empty:
+            print("[RETRAIN] skipped: test split empty")
             return False
 
         X_train, y_train, _ = dataset_to_matrices(split.train)
+        print(f"[RETRAIN] train rows = {len(X_train)}")
+        print(f"[RETRAIN] label distribution = {float(y_train.mean()):.3f}")
+        print(f"[RETRAIN] unique labels = {int(y_train.nunique())}")
+        if len(X_train) == 0:
+            print("[RETRAIN] skipped: dataset_to_matrices returned empty features")
+            return False
         if y_train.nunique() < 2:
+            print("[RETRAIN] skipped: labels not diverse")
             return False
 
+        print("[RETRAIN] training model...")
         opt = random_search_optimize(data)
         candidate = PersistenceModel(
             model_type=opt.params.get("model_type", "logistic"),
@@ -237,12 +251,14 @@ class TrainingEngine:
             random_state=42,
         )
         candidate.fit(X_train, y_train)
+        print("[RETRAIN] model trained successfully")
 
         new_metrics = self._evaluate(candidate, split.test)
         old_metrics = self._evaluate(self.model, split.test) if self.state.deployed_model_path else {"roc_auc": 0.0, "brier": 1.0}
 
         improved = (new_metrics["roc_auc"] > old_metrics.get("roc_auc", 0.0)) and (new_metrics["brier"] <= old_metrics.get("brier", 1.0))
         if not improved:
+            print("[RETRAIN] skipped: candidate model did not improve deployment metrics")
             return False
 
         ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
