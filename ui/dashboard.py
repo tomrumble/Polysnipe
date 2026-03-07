@@ -23,14 +23,13 @@ from src.calibration import build_stability_ratio_calibration
 from src.data import fetch_binance_klines_paginated, resolve_dataset_route
 from src.persistence_model import PersistenceInputs, PersistenceModel as DiffusionPersistenceModel
 from src.edge.model import PersistenceModel
-from src.edge.pipeline import run_edge_pipeline
 from src.edge.policy import (
     EXPLORATION_THRESHOLD,
     EXPLOITATION_THRESHOLD,
     MIN_EXPLORATION_SAMPLES,
     TradingPolicy,
 )
-from src.engine import ResearchEngine
+from src.engine import ResearchEngine, TrainingController, TrainingLifecycleState
 from src.tape import MarketTape
 from src.edge.dataset_builder import EdgeDatasetBuilder
 from src.edge.edge_score import compute_edge_score
@@ -643,7 +642,7 @@ def main() -> None:
     st.title("Edge Validation")
     st.caption("Scientific instrument panel for statistically defensible edge validation")
 
-    st.sidebar.header("SIMULATOR CONTROL")
+    st.sidebar.header("TRAINING ENGINE CONTROL")
     dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api", "synthetic"])
 
     now = datetime.now().replace(microsecond=0)
@@ -684,8 +683,8 @@ def main() -> None:
         "volatility_spike_veto": st.sidebar.checkbox("volatility_spike_veto", value=True),
     }
 
-    autopilot = st.sidebar.toggle("Autopilot Edge Discovery", value=False)
-    run_clicked = st.sidebar.button("Run Simulation", type="primary")
+    include_simulation = st.sidebar.checkbox("Enable replay simulation section", value=False)
+    run_clicked = st.sidebar.button("Run Training Engine", type="primary")
 
     if "sim_outputs" not in st.session_state:
         st.session_state["sim_outputs"] = None
@@ -695,37 +694,34 @@ def main() -> None:
         st.session_state["last_simulation_config"] = None
     if "run_error" not in st.session_state:
         st.session_state["run_error"] = ""
+    if "engine_state" not in st.session_state:
+        st.session_state["engine_state"] = None
 
     if run_clicked:
         start_dt = datetime.combine(start_date, start_clock)
         end_dt = datetime.combine(end_date, end_clock)
 
-        simulator = ReplaySimulator(
-            dataset=dataset,
-            heuristic_guards=heuristics,
-            signal_config=SignalConfig(
-                stability_ratio_threshold=stability_ratio_threshold,
-                entropy_threshold=entropy_threshold,
-                accel_threshold=accel_threshold,
-                spread_threshold=spread_threshold,
-                evaluation_window_seconds=60.0,
-            ),
-            api_limit=int(api_limit),
-            persistence_mode=persistence_mode,
-        )
         try:
-            st.session_state["sim_outputs"] = simulator.run(
-                start_time=start_dt,
-                end_time=end_dt,
-                stream_count=stream_count,
-                total_capital=total_capital,
-                transaction_cost=transaction_cost,
+            dataset_route = resolve_dataset_route(dataset)
+            if dataset_route.loader_name != "parquet":
+                raise RuntimeError("Training engine requires a parquet-backed dataset route")
+
+            tape = MarketTape(dataset_route.path)
+            engine = TrainingEngine(
+                tape=tape,
+                dataset_builder=EdgeDatasetBuilder(),
+                retrain_interval=1000,
+                metric_interval=100,
+                horizon_ticks=60,
             )
+            engine.start()
+            max_iterations = max(int((end_dt - start_dt).total_seconds()), 1)
+            st.session_state["engine_state"] = engine.run(max_iterations=max_iterations)
+            engine.stop()
             st.session_state["run_error"] = ""
-            if autopilot:
-                pipeline_result = run_edge_pipeline(st.session_state["sim_outputs"].telemetry)
-                st.session_state["pipeline_result"] = pipeline_result
-                rerun_simulator = ReplaySimulator(
+
+            if include_simulation:
+                simulator = ReplaySimulator(
                     dataset=dataset,
                     heuristic_guards=heuristics,
                     signal_config=SignalConfig(
@@ -738,38 +734,53 @@ def main() -> None:
                     api_limit=int(api_limit),
                     persistence_mode=persistence_mode,
                 )
-                st.session_state["sim_outputs"] = rerun_simulator.run(
+                st.session_state["sim_outputs"] = simulator.run(
                     start_time=start_dt,
                     end_time=end_dt,
                     stream_count=stream_count,
                     total_capital=total_capital,
                     transaction_cost=transaction_cost,
                 )
-            st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
-            st.session_state["last_simulation_config"] = {
-                "dataset": dataset,
-                "start": start_dt,
-                "end": end_dt,
-                "stream_count": stream_count,
-                "total_capital": total_capital,
-                "stability_ratio_threshold": stability_ratio_threshold,
-                "entropy_threshold": entropy_threshold,
-                "accel_threshold": accel_threshold,
-                "spread_threshold": spread_threshold,
-                "evaluation_window_seconds": 60.0,
-                "transaction_cost": transaction_cost,
-                **heuristics,
-            }
+                st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
+                st.session_state["last_simulation_config"] = {
+                    "dataset": dataset,
+                    "start": start_dt,
+                    "end": end_dt,
+                    "stream_count": stream_count,
+                    "total_capital": total_capital,
+                    "stability_ratio_threshold": stability_ratio_threshold,
+                    "entropy_threshold": entropy_threshold,
+                    "accel_threshold": accel_threshold,
+                    "spread_threshold": spread_threshold,
+                    "evaluation_window_seconds": 60.0,
+                    "transaction_cost": transaction_cost,
+                    **heuristics,
+                }
+            else:
+                st.session_state["sim_outputs"] = None
+                st.session_state["last_simulation_output"] = None
+                st.session_state["last_simulation_config"] = None
         except Exception as exc:
             st.session_state["sim_outputs"] = None
+            st.session_state["engine_state"] = None
             st.session_state["run_error"] = str(exc)
 
+    engine_state = st.session_state.get("engine_state")
     outputs: SimulationOutputs | None = st.session_state["sim_outputs"]
     if outputs is None:
         if st.session_state.get("run_error"):
             st.error(f"DATASET ERROR: {st.session_state['run_error']}")
+        elif engine_state is None:
+            st.info("Set parameters and click **Run Training Engine**. Optional: enable replay simulation for full analytics.")
         else:
-            st.info("Set parameters and click **Run Simulation**.")
+            st.success("Training engine completed. Enable replay simulation section for analytics panels.")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Observations Seen", f"{engine_state.observations_seen:,}")
+            c2.metric("Dataset Size", f"{engine_state.dataset_size:,}")
+            c3.metric("Retrains", f"{engine_state.retrains:,}")
+            c4.metric("Runtime State", str(engine_state.runtime_state))
+            if engine_state.latest_metrics:
+                st.json(engine_state.latest_metrics)
         return
 
     loaded_source = outputs.dataset_diagnostics.get("api_source", "")
@@ -944,18 +955,54 @@ def main() -> None:
 
     if autopilot:
         st.subheader("Autopilot Integration")
+        training_controller = TrainingController.load()
+
+        b1, b2, b3, b4 = st.columns(4)
+        if b1.button("Start Training", use_container_width=True):
+            training_controller.start_training(reset_progress=True)
+            st.rerun()
+        if b2.button("Pause Training", use_container_width=True):
+            training_controller.pause_training()
+            st.rerun()
+        if b3.button("Resume Training", use_container_width=True):
+            training_controller.resume_training()
+            st.rerun()
+        if b4.button("Stop Training", use_container_width=True):
+            training_controller.stop_training()
+            st.rerun()
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Training State", training_controller.training_state.value)
+        s2.metric("Controller Training Step", f"{training_controller.training_step:,}")
+        s3.metric("Controller Dataset Size", f"{training_controller.dataset_size:,}")
+
         default_tape = Path("datasets/binance/BTCUSDT_1s.parquet")
         if default_tape.exists():
             tape = MarketTape(default_tape)
-            engine = ResearchEngine(tape=tape, dataset_builder=EdgeDatasetBuilder(), retrain_interval=10000)
-            state = engine.run(max_ticks=500)
-            st.success(f"Autopilot processed {state.observations_seen} ticks. Retrains: {state.retrains}")
-            deployed_model = state.deployed_model_path or "models/latest_persistence_model.pkl"
+            engine = ResearchEngine(
+                tape=tape,
+                dataset_builder=EdgeDatasetBuilder(),
+                retrain_interval=10000,
+                training_controller=training_controller,
+            )
+            if training_controller.training_state == TrainingLifecycleState.RUNNING:
+                state = engine.run(max_ticks=500)
+                st.success(f"Autopilot processed {state.observations_seen} ticks. Retrains: {state.retrains}")
+            elif training_controller.training_state == TrainingLifecycleState.PAUSED:
+                st.info("Training is paused. Click Resume Training to continue from persisted artifacts.")
+                state = engine.state
+            else:
+                st.info("Training is stopped. Click Start Training to begin a new run.")
+                state = engine.state
+
+            deployed_model = training_controller.model_version
             train_timestamp = model_metrics.get("timestamp", "n/a") if model_metrics else "n/a"
+            last_retrain = training_controller.last_retrain_time.isoformat() if training_controller.last_retrain_time else "n/a"
             a1, a2, a3 = st.columns(3)
-            a1.metric("Current Model Version", Path(deployed_model).name)
+            a1.metric("Current Model Version", deployed_model)
             a2.metric("Training Timestamp", str(train_timestamp))
-            a3.metric("Dataset Size", f"{len(telemetry):,}")
+            a3.metric("Dataset Size", f"{training_controller.dataset_size:,}")
+            st.caption(f"Last retrain time: {last_retrain}")
         else:
             st.info("Run data ingestion first to create datasets/binance/BTCUSDT_1s.parquet")
 
