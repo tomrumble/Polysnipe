@@ -102,13 +102,16 @@ class TrainingEngine:
         if split.validation.empty or split.test.empty:
             return
 
+        X_train, y_train, _ = dataset_to_matrices(split.train)
+        if y_train.nunique() < 2:
+            return
+
         opt = random_search_optimize(data)
         candidate = PersistenceModel(
             model_type=opt.params.get("model_type", "logistic"),
             feature_scaling=opt.params.get("feature_scaling", True),
             random_state=42,
         )
-        X_train, y_train, _ = dataset_to_matrices(split.train)
         candidate.fit(X_train, y_train)
 
         new_metrics = self._evaluate(candidate, split.test)
@@ -158,17 +161,13 @@ class TrainingEngine:
                 continue
 
             observation = self.tape.next_tick()
-            features = extract_features(observation)
             future_frame = self.tape.peek_future(self.horizon_ticks)
             future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
-            outcome = self._selected_label(observation, future_path)
 
-            self.dataset_builder.append(
-                features,
-                outcome,
-                timestamp=observation.get("timestamp"),
-                symbol=str(observation.get("symbol", "UNKNOWN")),
-                metadata={"label_mode": self.label_mode},
+            self.dataset_builder.append_from_observation(
+                observation,
+                future_path,
+                label_mode=self.label_mode,
             )
             self.state.observations_seen += 1
             self.state.dataset_size += 1

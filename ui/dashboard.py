@@ -6,12 +6,19 @@ Run with:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure project root is on path when run as streamlit run ui/dashboard.py
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 import base64
 import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -21,7 +28,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
-from src.data import fetch_binance_klines_paginated, resolve_dataset_route
+from src.data import BinanceIngestor, fetch_binance_klines_paginated, resolve_dataset_route
 from src.persistence_model import PersistenceInputs, PersistenceModel as DiffusionPersistenceModel
 from src.edge.model import PersistenceModel
 from src.edge.policy import (
@@ -31,7 +38,7 @@ from src.edge.policy import (
     PolicySide,
     TradingPolicy,
 )
-from src.engine import ResearchEngine, TrainingController, TrainingLifecycleState
+from src.engine import ResearchEngine, TrainingController, TrainingEngine, TrainingLifecycleState
 from src.tape import MarketTape
 from src.edge.dataset_builder import EdgeDatasetBuilder
 from src.edge.edge_score import compute_edge_score
@@ -661,7 +668,11 @@ def main() -> None:
     )
 
     st.sidebar.header("SIMULATOR CONTROL")
-    dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api", "synthetic"])
+    dataset = st.sidebar.selectbox(
+        "dataset selector",
+        ["btc_binance_parquet", "eth_binance_parquet", "btc_binance_api", "eth_binance_api", "synthetic"],
+        help="Training engine requires a parquet dataset (e.g. btc_binance_parquet). Run data ingestion first to create datasets/binance/*.parquet.",
+    )
 
     now = datetime.now().replace(microsecond=0)
     start_default = now - timedelta(hours=1)
@@ -721,10 +732,25 @@ def main() -> None:
 
         try:
             dataset_route = resolve_dataset_route(dataset)
-            if dataset_route.loader_name != "parquet":
-                raise RuntimeError("Training engine requires a parquet-backed dataset route")
-
-            tape = MarketTape(dataset_route.path)
+            if dataset_route.loader_name == "synthetic":
+                raise RuntimeError(
+                    "Training engine requires real market data. "
+                    "Select 'btc_binance_parquet', 'eth_binance_parquet', 'btc_binance_api', or 'eth_binance_api'."
+                )
+            # Use parquet path from route, or for API routes use same path convention (we create it below).
+            if dataset_route.loader_name == "parquet" and dataset_route.path:
+                parquet_path = _project_root / dataset_route.path
+            else:
+                parquet_path = _project_root / "datasets" / "binance" / f"{dataset_route.symbol}_1s.parquet"
+            if not parquet_path.exists():
+                parquet_path.parent.mkdir(parents=True, exist_ok=True)
+                with st.spinner(f"Creating parquet dataset for {dataset_route.symbol} ({start_dt.date()} to {end_dt.date()})..."):
+                    BinanceIngestor(base_dir=_project_root / "datasets" / "binance").ingest(
+                        symbol=dataset_route.symbol,
+                        start_time=start_dt,
+                        end_time=end_dt,
+                    )
+            tape = MarketTape(str(parquet_path))
             engine = TrainingEngine(
                 tape=tape,
                 dataset_builder=EdgeDatasetBuilder(),
