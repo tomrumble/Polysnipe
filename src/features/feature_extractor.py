@@ -25,7 +25,12 @@ class FeatureVector:
     acceleration: float
     seconds_remaining: int
     distance_to_boundary: float
-    regime: int
+    regime_label: int
+
+    @property
+    def regime(self) -> int:
+        """Backward-compatible alias."""
+        return self.regime_label
 
 
 def _read(observation: Any, *keys: str, default: float = 0.0) -> Any:
@@ -38,10 +43,7 @@ def _read(observation: Any, *keys: str, default: float = 0.0) -> Any:
 
 
 def extract_features(observation: Any) -> FeatureVector:
-    """Extract the canonical model feature vector from telemetry observation."""
-
-    regime_label = str(_read(observation, "regime_label", "regime", default="PERSISTENT_COMPRESSION"))
-
+    regime_name = str(_read(observation, "regime_label", "regime", default="PERSISTENT_COMPRESSION"))
     return FeatureVector(
         entropy=float(_read(observation, "directional_entropy", "entropy", "entropy_at_entry", default=0.0)),
         entropy_slope=float(_read(observation, "entropy_velocity", "entropy_slope", "entropy_slope_before_entry", default=0.0)),
@@ -52,5 +54,5 @@ def extract_features(observation: Any) -> FeatureVector:
         acceleration=float(_read(observation, "price_acceleration", "acceleration", default=0.0)),
         seconds_remaining=int(float(_read(observation, "seconds_remaining", "seconds_to_expiry_at_entry", default=0.0))),
         distance_to_boundary=float(_read(observation, "distance_to_boundary_at_entry", "distance_to_boundary", default=0.0)),
-        regime=REGIME_ENCODING.get(regime_label, 0),
+        regime_label=REGIME_ENCODING.get(regime_name, 0),
     )

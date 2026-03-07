@@ -25,6 +25,9 @@ from src.persistence_model import PersistenceInputs, PersistenceModel as Diffusi
 from src.edge.model import PersistenceModel
 from src.edge.pipeline import run_edge_pipeline
 from src.edge.policy import TradingPolicy
+from src.engine import ResearchEngine
+from src.tape import MarketTape
+from src.edge.dataset_builder import EdgeDatasetBuilder
 from src.features import extract_features
 from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
@@ -705,7 +708,7 @@ def main() -> None:
     latest_model = Path("models/latest_persistence_model.pkl")
     if latest_model.exists() and not telemetry.empty:
         edge_model = PersistenceModel.load(latest_model)
-        names = ["entropy", "entropy_slope", "spread", "volatility", "volatility_slope", "stability_ratio", "acceleration", "seconds_remaining", "distance_to_boundary", "regime"]
+        names = ["entropy", "entropy_slope", "spread", "volatility", "volatility_slope", "stability_ratio", "acceleration", "seconds_remaining", "distance_to_boundary", "regime_label"]
         imps = edge_model.feature_importance_
         if imps is not None:
             fi = pd.DataFrame({"feature": names, "importance": imps})
@@ -715,6 +718,19 @@ def main() -> None:
     if diag_path.exists():
         st.subheader("Edge Surface")
         st.components.v1.html(diag_path.read_text(), height=500, scrolling=True)
+
+
+    st.header("Autopilot Edge Discovery")
+    autopilot = st.toggle("Autopilot Edge Discovery", value=False)
+    if autopilot:
+        default_tape = Path("datasets/binance/BTCUSDT_1s.parquet")
+        if default_tape.exists():
+            tape = MarketTape(default_tape)
+            engine = ResearchEngine(tape=tape, dataset_builder=EdgeDatasetBuilder(), retrain_interval=10000)
+            state = engine.run(max_ticks=500)
+            st.success(f"Autopilot processed {state.observations_seen} ticks. Retrains: {state.retrains}")
+        else:
+            st.info("Run data ingestion first to create datasets/binance/BTCUSDT_1s.parquet")
 
     st.header("Trade Telemetry")
     st.dataframe(telemetry, use_container_width=True, height=340)
