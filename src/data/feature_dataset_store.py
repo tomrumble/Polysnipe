@@ -19,6 +19,49 @@ FEATURE_DATASET_DIR = Path("datasets/features")
 METADATA_DIR = Path("datasets/metadata")
 
 
+REQUIRED_FEATURE_COLUMNS = [*FEATURE_COLUMNS]
+PERSISTENCE_LABEL_ALIASES = ["persistence_label", "label_persistence", "persistence_outcome", "persistence", "label"]
+DRIFT_LABEL_ALIASES = ["drift_10s_pct", "label_drift"]
+
+
+def _normalize_feature_dataset(frame: pd.DataFrame) -> pd.DataFrame:
+    """Ensure the feature dataset has canonical feature/label columns and usable rows."""
+
+    normalized = frame.copy()
+    if "timestamp" in normalized.columns:
+        normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True, errors="coerce")
+
+    # Canonical persistence label.
+    if "persistence_label" not in normalized.columns:
+        for candidate in PERSISTENCE_LABEL_ALIASES:
+            if candidate in normalized.columns:
+                normalized["persistence_label"] = pd.to_numeric(normalized[candidate], errors="coerce")
+                break
+
+    # Canonical drift label.
+    if "drift_10s_pct" not in normalized.columns:
+        for candidate in DRIFT_LABEL_ALIASES:
+            if candidate in normalized.columns:
+                normalized["drift_10s_pct"] = pd.to_numeric(normalized[candidate], errors="coerce")
+                break
+
+    # Backward-compatible aliases used by different code paths.
+    if "persistence_label" in normalized.columns:
+        normalized["label_persistence"] = pd.to_numeric(normalized["persistence_label"], errors="coerce")
+        normalized["persistence_outcome"] = pd.to_numeric(normalized["persistence_label"], errors="coerce")
+        normalized["persistence"] = pd.to_numeric(normalized["persistence_label"], errors="coerce")
+    if "drift_10s_pct" in normalized.columns:
+        normalized["label_drift"] = pd.to_numeric(normalized["drift_10s_pct"], errors="coerce")
+
+    for feature in REQUIRED_FEATURE_COLUMNS:
+        if feature in normalized.columns:
+            normalized[feature] = pd.to_numeric(normalized[feature], errors="coerce")
+
+    required = [c for c in ["timestamp", *REQUIRED_FEATURE_COLUMNS, "persistence_label", "drift_10s_pct"] if c in normalized.columns]
+    normalized = normalized.dropna(subset=required)
+    return normalized.sort_values("timestamp").reset_index(drop=True)
+
+
 def load_parquet_dataset(
     path: str | Path,
     *,
@@ -28,17 +71,22 @@ def load_parquet_dataset(
 ) -> pd.DataFrame:
     """Load and optionally slice a parquet dataset for fast in-memory replay."""
 
-    frame = pd.read_parquet(path).sort_values("timestamp").reset_index(drop=True)
-    if target_samples is None or target_samples <= 0 or target_samples >= len(frame):
-        return frame
+    frame = pd.read_parquet(path)
+    frame = frame.sort_values("timestamp").reset_index(drop=True)
 
-    if randomized_start:
-        rng = random.Random(random_seed)
-        max_start = max(len(frame) - target_samples, 0)
-        start_index = rng.randint(0, max_start)
-        return frame.iloc[start_index : start_index + target_samples].reset_index(drop=True)
+    if target_samples is not None and target_samples > 0 and target_samples < len(frame):
+        if randomized_start:
+            rng = random.Random(random_seed)
+            max_start = max(len(frame) - target_samples, 0)
+            start_index = rng.randint(0, max_start)
+            frame = frame.iloc[start_index : start_index + target_samples].reset_index(drop=True)
+        else:
+            frame = frame.tail(target_samples).reset_index(drop=True)
 
-    return frame.tail(target_samples).reset_index(drop=True)
+    if any(col in frame.columns for col in REQUIRED_FEATURE_COLUMNS):
+        frame = _normalize_feature_dataset(frame)
+
+    return frame
 
 
 def dataframe_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -53,7 +101,7 @@ def build_feature_dataset(
     """Generate feature + label rows from raw market candles."""
 
     if raw_frame.empty:
-        return pd.DataFrame(columns=["timestamp", "price", *FEATURE_COLUMNS, "label_persistence", "label_drift"])
+        return pd.DataFrame(columns=["timestamp", "price", *REQUIRED_FEATURE_COLUMNS, "persistence_label", "drift_10s_pct"])
 
     frame = raw_frame.sort_values("timestamp").reset_index(drop=True)
     price_col = "close" if "close" in frame.columns else "price"
@@ -70,14 +118,13 @@ def build_feature_dataset(
                 "timestamp": observation.get("timestamp"),
                 "price": float(observation.get(price_col, observation.get("price", 0.0))),
                 **fv.__dict__,
-                "label_persistence": int(label_persistence(observation, future_path)),
-                "label_drift": float(label_future_drift(observation, future_path, horizon=10)),
+                "persistence_label": int(label_persistence(observation, future_path)),
+                "drift_10s_pct": float(label_future_drift(observation, future_path, horizon=10)),
             }
         )
 
-    dataset = pd.DataFrame(rows)
-    dataset["timestamp"] = pd.to_datetime(dataset["timestamp"], utc=True, errors="coerce")
-    return dataset.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    dataset = _normalize_feature_dataset(pd.DataFrame(rows))
+    return dataset
 
 
 def save_feature_dataset(
@@ -102,11 +149,11 @@ def save_feature_dataset(
         existing = pd.read_parquet(dataset_path)
         combined = pd.concat([existing, combined], ignore_index=True)
 
-    if "timestamp" in combined.columns:
-        combined["timestamp"] = pd.to_datetime(combined["timestamp"], utc=True, errors="coerce")
-        combined = combined.dropna(subset=["timestamp"])
-        combined = combined.drop_duplicates(subset=["timestamp"], keep="last")
-        combined = combined.sort_values("timestamp").reset_index(drop=True)
+    combined = _normalize_feature_dataset(combined)
+
+    # Row identity is timestamp for this single-symbol/interval feature dataset.
+    combined = combined.drop_duplicates(subset=["timestamp"], keep="last")
+    combined = combined.sort_values("timestamp").reset_index(drop=True)
 
     combined.to_parquet(dataset_path, index=False)
 
@@ -118,7 +165,12 @@ def save_feature_dataset(
         "feature_version": feature_version,
         "label_mode": label_mode,
         "samples": int(len(combined)),
+        "created_at": datetime.now(tz=timezone.utc).date().isoformat(),
         "last_updated": datetime.now(tz=timezone.utc).isoformat(),
+        "schema": {
+            "features": REQUIRED_FEATURE_COLUMNS,
+            "labels": ["persistence_label", "drift_10s_pct"],
+        },
     }
     metadata_path = METADATA_DIR / f"{dataset_name}.json"
     metadata_path.write_text(json.dumps(metadata, indent=2))
@@ -127,7 +179,8 @@ def save_feature_dataset(
 
 
 def load_feature_dataset(dataset_name: str) -> pd.DataFrame:
-    return pd.read_parquet(FEATURE_DATASET_DIR / f"{dataset_name}.parquet")
+    frame = pd.read_parquet(FEATURE_DATASET_DIR / f"{dataset_name}.parquet")
+    return _normalize_feature_dataset(frame)
 
 
 def load_dataset_metadata(dataset_name: str) -> dict[str, Any]:

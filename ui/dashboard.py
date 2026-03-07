@@ -805,6 +805,17 @@ def _build_live_engine(dataset: str, *, mode: str, target_samples: int) -> Train
             target_samples=target_samples,
             randomized_start=True,
         )
+        if feature_slice.empty:
+            raise RuntimeError(f"Feature dataset '{dataset_name}' has no usable rows after schema validation")
+
+        preview = feature_slice.iloc[0].to_dict()
+        _push_event(
+            "Dataset sanity check | "
+            f"rows={len(feature_slice):,} "
+            f"features={[preview.get('entropy'), preview.get('volatility'), preview.get('stability_ratio')]} "
+            f"label={preview.get('persistence_label', preview.get('label_persistence'))}"
+        )
+
         engine.load_dataset(dataframe_to_records(feature_slice), precomputed_features=True)
         st.session_state["dataset_panel"] = load_dataset_metadata(dataset_name)
     else:
@@ -839,9 +850,6 @@ def main() -> None:
     simulation_speed = st.sidebar.selectbox("simulation_speed", ["1x", "5x", "10x", "50x", "100x"], index=2)
     chart_update_every = int(st.sidebar.number_input("chart_update_every_n_steps", min_value=1, max_value=100, value=25, step=1))
     execution_mode = st.sidebar.selectbox("execution_mode", ["Research", "Live"], index=0)
-    st.session_state["target_samples"] = target_samples
-    st.session_state["simulation_speed"] = simulation_speed
-    st.session_state["chart_update_every_n_steps"] = chart_update_every
 
     b1, b2, b3 = st.sidebar.columns(3)
     start_clicked = b1.button("Start Simulation", type="primary", use_container_width=True)
@@ -888,17 +896,42 @@ def main() -> None:
     # Fixed slot for error so main() always has same block count (avoids setIn index mismatch when fragment runs).
     error_ph = st.empty()
     if st.session_state.get("run_error"):
-        error_ph.error(st.session_state["run_error"])
-    else:
-        error_ph.empty()
+        st.error(st.session_state["run_error"])
 
-    # Single placeholder: fragment writes one container per run to avoid setIn/index mismatch on reruns (e.g. speed change).
-    live_panel_ph = st.empty()
-    st.session_state["_live_panel_ph"] = live_panel_ph
+    st.session_state["target_samples"] = target_samples
+    st.session_state["simulation_speed"] = simulation_speed
+    st.session_state["chart_update_every_n_steps"] = chart_update_every
 
-    fragment_interval_sec = 0.15
+    # Placeholders live in main() so they are not recreated when the fragment reruns.
+    # Fragment only updates these in place -> no DOM replace, no flash.
+    controls_ph = st.empty()
+    market_chart_ph = st.empty()
+    metrics_ph = st.empty()
+    learning_charts_ph = st.empty()
+    feature_panel_ph = st.empty()
+    event_log_ph = st.empty()
+    st.session_state["_ph"] = {
+        "controls": controls_ph,
+        "market_chart": market_chart_ph,
+        "metrics": metrics_ph,
+        "learning_charts": learning_charts_ph,
+        "feature_panel": feature_panel_ph,
+        "event_log": event_log_ph,
+    }
 
-    @st.fragment(run_every=fragment_interval_sec)
+    panel = st.session_state.get("dataset_panel", {})
+    with st.container():
+        st.subheader("Dataset Panel")
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("dataset_name", str(panel.get("dataset_name", dataset)))
+        d2.metric("dataset_source", str(panel.get("dataset_source", resolve_dataset_route(dataset).source)))
+        d3.metric("feature_version", str(panel.get("feature_version", "v1")))
+        d4.metric("samples", f"{int(panel.get('samples', 0)):,}")
+        d5.metric("last_updated", str(panel.get("last_updated", "-"))[:19])
+
+    delta_sec = max(0.05, _resolve_speed_delay(st.session_state.get("simulation_speed", "10x")))
+
+    @st.fragment(run_every=delta_sec)
     def live_simulation_panel():
         ph = st.session_state.get("_live_panel_ph")
         if ph is None:
@@ -952,6 +985,26 @@ def main() -> None:
                     st.session_state["signal_outcome_history"].append(
                         {"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal, "outcome": snapshot.outcome_label}
                     )
+                    st.session_state["feature_importance"] = snapshot.feature_importance
+
+                panel_data = st.session_state.get("dataset_panel", {})
+                panel_data["samples"] = int(max(panel_data.get("samples", 0), snapshot.dataset_size))
+                panel_data["last_updated"] = datetime.now().isoformat()
+                st.session_state["dataset_panel"] = panel_data
+
+        candles_df = pd.DataFrame(st.session_state["market_candles"])
+        if not candles_df.empty:
+            fig = go.Figure(
+                data=[go.Candlestick(
+                    x=pd.to_datetime(candles_df["timestamp"]),
+                    open=candles_df["open"],
+                    high=candles_df["high"],
+                    low=candles_df["low"],
+                    close=candles_df["close"],
+                )]
+            )
+            fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
+            ph["market_chart"].plotly_chart(fig, use_container_width=True)
 
                     _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
                     _push_event(f"Feature vector generated: {snapshot.feature_vector}")
