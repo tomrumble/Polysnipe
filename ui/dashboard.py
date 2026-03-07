@@ -204,6 +204,8 @@ class ReplaySimulator:
         end_time: datetime,
         stream_count: int,
         total_capital: float,
+        transaction_cost: float,
+        payout: float = 0.95,
     ) -> SimulationOutputs:
         if end_time <= start_time:
             raise ValueError("end_time must be after start_time")
@@ -351,7 +353,7 @@ class ReplaySimulator:
             min_price_until_expiry = float(np.min(future_path)) if len(future_path) else current_price
             expiry_iso = timestamps[expiry_idx].isoformat()
 
-            hit_boundary = (max_price_until_expiry >= boundary_price) if boundary_side > 0 else (min_price_until_expiry <= boundary_price)
+            trade_direction = "UP" if boundary_side > 0 else "DOWN"
 
             trade_outcome = "NO_TRADE"
             trade_return = 0.0
@@ -359,13 +361,22 @@ class ReplaySimulator:
             stream_idx = i % stream_count
 
             if should_trade:
-                if hit_boundary:
-                    trade_outcome = "LOSS"
-                    trade_return = -0.01
-                    failure = 1
-                else:
-                    trade_outcome = "WIN"
-                    trade_return = 0.01
+                won_trade = _is_trade_win(
+                    trade_direction=trade_direction,
+                    boundary_price=boundary_price,
+                    max_price_until_expiry=max_price_until_expiry,
+                    min_price_until_expiry=min_price_until_expiry,
+                )
+                trade_outcome = "WIN" if won_trade else "LOSS"
+                trade_return = compute_trade_return(
+                    trade_direction=trade_direction,
+                    boundary_price=boundary_price,
+                    max_price_until_expiry=max_price_until_expiry,
+                    min_price_until_expiry=min_price_until_expiry,
+                    payout=payout,
+                    transaction_cost=transaction_cost,
+                )
+                failure = 0 if won_trade else 1
 
                 stream_balances[stream_idx] *= 1.0 + trade_return
 
@@ -401,6 +412,7 @@ class ReplaySimulator:
                 "trade_outcome": trade_outcome,
                 "failure": failure,
                 "return": trade_return,
+                "trade_direction": trade_direction,
                 "max_price_until_expiry": max_price_until_expiry,
                 "min_price_until_expiry": min_price_until_expiry,
                 "price_path_until_expiry": json.dumps([float(x) for x in future_path.tolist()]),
@@ -428,6 +440,42 @@ class ReplaySimulator:
             equity_curve=equity_curve,
             dataset_diagnostics=dataset_diagnostics,
         )
+
+
+
+
+def _is_trade_win(
+    *,
+    trade_direction: str,
+    boundary_price: float,
+    max_price_until_expiry: float,
+    min_price_until_expiry: float,
+) -> bool:
+    if trade_direction == "UP":
+        return max_price_until_expiry >= boundary_price
+    if trade_direction == "DOWN":
+        return min_price_until_expiry <= boundary_price
+    raise ValueError(f"Unsupported trade_direction: {trade_direction}")
+
+
+def compute_trade_return(
+    *,
+    trade_direction: str,
+    boundary_price: float,
+    max_price_until_expiry: float,
+    min_price_until_expiry: float,
+    payout: float,
+    transaction_cost: float,
+) -> float:
+    """Compute market-path-derived trade return without using model labels."""
+    won_trade = _is_trade_win(
+        trade_direction=trade_direction,
+        boundary_price=boundary_price,
+        max_price_until_expiry=max_price_until_expiry,
+        min_price_until_expiry=min_price_until_expiry,
+    )
+    gross_return = payout if won_trade else -1.0
+    return gross_return - transaction_cost
 
 
 def _drawdown_series(equity: pd.Series) -> pd.Series:
@@ -497,7 +545,7 @@ def _profitability_metrics(traded: pd.DataFrame, transaction_cost: float) -> tup
         }, pd.DataFrame(columns=["timestamp", "equity"])
 
     frame = traded.sort_values("timestamp").copy()
-    frame["net_return"] = frame["return"] - transaction_cost
+    frame["net_return"] = frame["return"]
     wins = frame[frame["net_return"] > 0]["net_return"]
     losses = frame[frame["net_return"] <= 0]["net_return"]
     win_rate = float((frame["net_return"] > 0).mean())
@@ -671,6 +719,7 @@ def main() -> None:
                 end_time=end_dt,
                 stream_count=stream_count,
                 total_capital=total_capital,
+                transaction_cost=transaction_cost,
             )
             st.session_state["run_error"] = ""
             if autopilot:
@@ -694,6 +743,7 @@ def main() -> None:
                     end_time=end_dt,
                     stream_count=stream_count,
                     total_capital=total_capital,
+                    transaction_cost=transaction_cost,
                 )
             st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
             st.session_state["last_simulation_config"] = {
