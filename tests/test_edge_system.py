@@ -13,6 +13,7 @@ from src.edge.optimizer import _objective
 from src.edge.pipeline import run_edge_pipeline
 from src.edge.policy import TradingPolicy
 from src.features import extract_features
+from src.labels import label_future_drift
 from ui.dashboard import compute_trade_return
 
 
@@ -175,3 +176,18 @@ def test_compute_trade_return_varies_with_market_path():
     assert len(set(returns)) > 1
     assert returns[0] == pytest.approx(0.9495)
     assert returns[1] == pytest.approx(-1.0005)
+
+
+def test_label_future_drift_bounds_horizon():
+    observation = {"entry_price": 100.0}
+    future_path = [100.5, 101.0]
+
+    assert label_future_drift(observation, future_path, horizon=10) == pytest.approx(0.01)
+
+
+def test_dataset_builder_drift_mode_persists_drift_column(tmp_path: Path):
+    ds_path = tmp_path / "edge_drift.parquet"
+    data = build_edge_dataset(sample_telemetry(), dataset_path=ds_path, append=False, label_mode="drift")
+
+    assert "drift_10s_pct" in data.columns
+    assert data["drift_10s_pct"].notna().all()

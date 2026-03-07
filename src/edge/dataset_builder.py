@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.features import FeatureVector, extract_features
-from src.labels import label_drift_10s_pct, label_persistence, label_short_horizon_move
+from src.labels import label_future_drift, label_persistence, label_short_horizon_move
 
 FEATURE_COLUMNS = [
     "entropy",
@@ -97,35 +97,39 @@ class EdgeDatasetBuilder:
         label_mode: str = "persistence",
     ) -> pd.DataFrame:
         fv = extract_features(observation)
-        persistence_label = int(label_persistence(observation, future_path))
-        short_move_label = int(label_short_horizon_move(observation, future_path))
-        drift_10s_pct = float(label_drift_10s_pct(observation, future_path))
-
-        mode_to_target = {
-            "persistence": persistence_label,
-            "short_move": short_move_label,
-            "drift": drift_10s_pct,
-        }
-        if label_mode not in mode_to_target:
-            raise ValueError(f"Unsupported label_mode '{label_mode}'")
-
+        drift_10s_pct = None
+        if label_mode == "short_move":
+            outcome = int(label_short_horizon_move(observation, future_path))
+        elif label_mode == "drift":
+            drift_10s_pct = float(label_future_drift(observation, future_path, horizon=10))
+            outcome = int(drift_10s_pct > 0.0)
+        else:
+            outcome = int(label_persistence(observation, future_path))
         raw_return = observation.get("return")
         trade_return = float(raw_return) if raw_return is not None and pd.notna(raw_return) else None
-        return self.append(
+        payload_metadata = {
+            "entry_price": observation.get("entry_price"),
+            "boundary_price": observation.get("boundary_price"),
+            "label_mode": label_mode,
+        }
+        if drift_10s_pct is not None:
+            payload_metadata["drift_10s_pct"] = drift_10s_pct
+
+        frame = self.append(
             fv,
             persistence_label,
             short_move_label=short_move_label,
             drift_10s_pct=drift_10s_pct,
             timestamp=observation.get("timestamp"),
             symbol=str(observation.get("symbol", "UNKNOWN")),
-            metadata={
-                "entry_price": observation.get("entry_price"),
-                "boundary_price": observation.get("boundary_price"),
-                "label_mode": label_mode,
-                "target": mode_to_target[label_mode],
-            },
+            metadata=payload_metadata,
             trade_return=trade_return,
         )
+        if drift_10s_pct is not None:
+            mask = (frame["timestamp"] == pd.to_datetime(observation.get("timestamp"), utc=True)) & (frame["symbol"] == str(observation.get("symbol", "UNKNOWN")))
+            frame.loc[mask, "drift_10s_pct"] = drift_10s_pct
+            frame.to_parquet(self.dataset_path, index=False)
+        return frame
 
 
 def build_edge_dataset(
