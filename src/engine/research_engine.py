@@ -101,6 +101,7 @@ class ResearchEngine:
             observation = self.tape.next_tick()
             features = extract_features(observation)
             probability = self.model.predict_probability(features.__dict__) if self.state.deployed_model_path else 0.5
+            self.policy.dataset_size = self.state.observations_seen
             _ = self.policy.evaluate(probability)
 
             future_frame = self.tape.peek_future(self.horizon_ticks)

@@ -14,11 +14,17 @@ def compute_edge_score(
     probability_rank_correlation: float,
     max_drawdown: float,
     trade_rate: float,
-) -> dict[str, float]:
+) -> dict[str, float | str]:
     """Compute a bounded edge score from core defensibility components.
 
     Returns component diagnostics with `edge_score` in [0, 1].
     """
+
+    if trade_rate == 0:
+        return {
+            "edge_score": 0.0,
+            "reason": "insufficient_trade_activity",
+        }
 
     normalized_expected_value = _clamp((expected_value + 0.01) / 0.03)
     calibration_quality = _clamp(1.0 - (calibration_error / 0.15))

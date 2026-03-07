@@ -22,7 +22,12 @@ from src.data import fetch_binance_klines_paginated, resolve_dataset_route
 from src.persistence_model import PersistenceInputs, PersistenceModel as DiffusionPersistenceModel
 from src.edge.model import PersistenceModel
 from src.edge.pipeline import run_edge_pipeline
-from src.edge.policy import TradingPolicy
+from src.edge.policy import (
+    EXPLORATION_THRESHOLD,
+    EXPLOITATION_THRESHOLD,
+    MIN_EXPLORATION_SAMPLES,
+    TradingPolicy,
+)
 from src.engine import ResearchEngine
 from src.tape import MarketTape
 from src.edge.dataset_builder import EdgeDatasetBuilder
@@ -321,6 +326,7 @@ class ReplaySimulator:
             model_probability = out.persistence_probability
             if self.edge_model is not None:
                 model_probability = self.edge_model.predict_probability(features)
+            self.policy.dataset_size = i
             policy_decision = self.policy.evaluate(model_probability)
 
             guard_accel_fail = self.heuristic_guards["acceleration_veto"] and abs(accel) > 3.5
@@ -765,17 +771,23 @@ def main() -> None:
         st.plotly_chart(px.line(rolling, x="timestamp", y="rolling_expected_value_500", title="Rolling Expected Value (500 Trades)"), use_container_width=True)
 
     st.subheader("Trade Selectivity")
-    threshold = TradingPolicy().confidence_threshold
+    training_samples = len(telemetry)
+    exploration_mode = training_samples < MIN_EXPLORATION_SAMPLES
+    threshold = EXPLORATION_THRESHOLD if exploration_mode else EXPLOITATION_THRESHOLD
     metrics_path = Path("models/model_metrics.json")
     model_metrics: dict = {}
     if metrics_path.exists():
         model_metrics = json.loads(metrics_path.read_text())
-        threshold = float(model_metrics.get("best_params", {}).get("probability_threshold", threshold))
     t1, t2, t3, t4 = st.columns(4)
-    t1.metric("Total Observations Evaluated", f"{len(telemetry)}")
+    t1.metric("Total Observations Evaluated", f"{training_samples}")
     t2.metric("Total Trades Executed", f"{len(trades)}")
     t3.metric("Trade Frequency", f"{trade_rate * 100:.2f}%")
     t4.metric("Policy Probability Threshold", f"{threshold:.2f}")
+
+    t5, t6, t7 = st.columns(3)
+    t5.metric("training_samples", f"{training_samples:,}")
+    t6.metric("exploration_mode", "true" if exploration_mode else "false")
+    t7.metric("policy_threshold", f"{threshold:.2f}")
 
     if autopilot:
         st.subheader("Autopilot Integration")
