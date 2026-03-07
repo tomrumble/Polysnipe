@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from sklearn.metrics import brier_score_loss, mean_absolute_error, mean_squared_error, roc_auc_score
 
@@ -16,7 +15,6 @@ from src.edge.cross_validation import chronological_split
 from src.edge.dataset_builder import EdgeDatasetBuilder, dataset_to_matrices
 from src.edge.diagnostics import generate_edge_surfaces
 from src.edge.model import PersistenceModel
-from src.edge.optimizer import random_search_optimize
 from src.edge.policy import TradingPolicy
 from src.features import extract_features
 from src.labels import label_drift_10s_pct, label_persistence, label_short_horizon_move
@@ -28,7 +26,15 @@ from src.engine.training_controller import TrainingController, TrainingLifecycle
 class EngineState:
     observations_seen: int = 0
     retrains: int = 0
+    last_retrain_observation: int = 0
     deployed_model_path: str | None = None
+
+
+@dataclass(frozen=True)
+class FixedTrainingConfig:
+    model_type: str = "logistic"
+    feature_scaling: bool = True
+    random_state: int = 42
 
 
 class ResearchEngine:
@@ -39,23 +45,26 @@ class ResearchEngine:
         retrain_interval: int = 10_000,
         horizon_ticks: int = 60,
         confidence_threshold: float = 0.97,
-        policy_mode: str = "persistence",
-        drift_threshold: float = 0.001,
+        min_training_samples: int = 100,
+        retrain_window_size: int = 5_000,
+        training_config: FixedTrainingConfig | None = None,
+        enable_retrain_diagnostics: bool = False,
     ) -> None:
         self.tape = tape
         self.dataset_builder = dataset_builder or EdgeDatasetBuilder()
         self.retrain_interval = retrain_interval
         self.horizon_ticks = horizon_ticks
-        self.policy = TradingPolicy(
-            confidence_threshold=confidence_threshold,
-            mode=policy_mode,
-            drift_threshold=drift_threshold,
+        self.min_training_samples = min_training_samples
+        self.retrain_window_size = retrain_window_size
+        self.training_config = training_config or FixedTrainingConfig()
+        self.enable_retrain_diagnostics = enable_retrain_diagnostics
+        self.policy = TradingPolicy(confidence_threshold=confidence_threshold)
+        self.model: PersistenceModel = PersistenceModel(
+            model_type=self.training_config.model_type,
+            feature_scaling=self.training_config.feature_scaling,
+            random_state=self.training_config.random_state,
         )
-        self.model: PersistenceModel = PersistenceModel()
-        latest_model_path = Path("models/latest_persistence_model.pkl")
-        if latest_model_path.exists():
-            self.model = PersistenceModel.load(latest_model_path)
-        self.state = EngineState(observations_seen=self.training_controller.training_step)
+        self.state = EngineState()
 
     def _evaluate(self, model: PersistenceModel, test_frame: pd.DataFrame) -> dict[str, float]:
         X_test, y_test, _ = dataset_to_matrices(test_frame, label_mode=model.label_mode)
@@ -69,20 +78,26 @@ class ResearchEngine:
         return {"mse": mse, "mae": mae}
 
     def _maybe_retrain(self) -> None:
-        data = self.dataset_builder._load()
-        if len(data) < 100:
+        if self.state.observations_seen - self.state.last_retrain_observation < self.retrain_interval:
             return
+
+        self.state.last_retrain_observation = self.state.observations_seen
+
+        data = self.dataset_builder._load()
+        if len(data) < self.min_training_samples:
+            return
+
+        if self.retrain_window_size > 0 and len(data) > self.retrain_window_size:
+            data = data.tail(self.retrain_window_size).reset_index(drop=True)
 
         split = chronological_split(data)
         if split.validation.empty or split.test.empty:
             return
 
-        opt = random_search_optimize(data, label_mode="persistence")
         candidate = PersistenceModel(
-            model_type=opt.params.get("model_type", "logistic"),
-            feature_scaling=opt.params.get("feature_scaling", True),
-            random_state=42,
-            label_mode="persistence",
+            model_type=self.training_config.model_type,
+            feature_scaling=self.training_config.feature_scaling,
+            random_state=self.training_config.random_state,
         )
         X_train, y_train, _ = dataset_to_matrices(split.train, label_mode="persistence")
         candidate.fit(X_train, y_train)
@@ -107,12 +122,17 @@ class ResearchEngine:
 
             metrics = {
                 "timestamp": ts,
-                "optimizer_score": opt.score,
-                "best_params": opt.params,
+                "training_config": {
+                    "model_type": self.training_config.model_type,
+                    "feature_scaling": self.training_config.feature_scaling,
+                    "random_state": self.training_config.random_state,
+                },
                 "test": new_metrics,
+                "observations_seen": self.state.observations_seen,
             }
             Path("models/model_metrics.json").write_text(json.dumps(metrics, indent=2))
-            generate_edge_surfaces(data)
+            if self.enable_retrain_diagnostics:
+                generate_edge_surfaces(data)
 
     def run(self, max_ticks: int | None = None) -> EngineState:
         if self.training_controller.training_state != TrainingLifecycleState.RUNNING:
@@ -151,11 +171,6 @@ class ResearchEngine:
 
             seen += 1
             self.state.observations_seen += 1
-            self.training_controller.update_progress(
-                training_step=self.state.observations_seen,
-                dataset_size=self.state.observations_seen,
-            )
-            if self.state.observations_seen % self.retrain_interval == 0:
-                self._maybe_retrain()
+            self._maybe_retrain()
 
         return self.state
