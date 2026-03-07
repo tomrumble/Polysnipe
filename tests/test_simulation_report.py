@@ -10,46 +10,70 @@ from src.reporting import generate_simulation_report
 
 
 class DummyOutput:
-    def __init__(self, telemetry: pd.DataFrame, trades: pd.DataFrame, equity_curve: pd.DataFrame) -> None:
+    def __init__(
+        self,
+        telemetry: pd.DataFrame,
+        trades: pd.DataFrame,
+        equity_curve: pd.DataFrame,
+        dataset_diagnostics: dict | None = None,
+    ) -> None:
         self.telemetry = telemetry
         self.trades = trades
         self.equity_curve = equity_curve
+        self.dataset_diagnostics = dataset_diagnostics or {}
 
 
-def test_generate_simulation_report_with_trades():
+def test_generate_simulation_report_with_trades_and_new_diagnostics():
     telemetry = pd.DataFrame(
         [
             {
                 "trade_outcome": "WIN",
                 "return": 0.01,
-                "seconds_to_expiry_at_entry": 30,
+                "seconds_to_expiry_at_entry": 4,
                 "signal_reason": "late_state_collapse",
                 "regime_label": "PERSISTENT_COMPRESSION",
                 "veto_reason": "",
+                "collapse_reason": "",
+                "directional_entropy": 0.5,
                 "entropy_at_entry": 0.5,
+                "spread": 0.02,
                 "spread_at_entry": 0.02,
+                "volatility": 0.1,
                 "volatility_at_entry": 0.1,
+                "stability_ratio": 2.2,
                 "distance_to_boundary_at_entry": 2.5,
                 "entropy_slope_before_entry": -0.21,
             },
             {
                 "trade_outcome": "WIN",
                 "return": 0.01,
-                "seconds_to_expiry_at_entry": 30,
+                "seconds_to_expiry_at_entry": 11,
                 "signal_reason": "late_state_collapse",
                 "regime_label": "PERSISTENT_COMPRESSION",
                 "veto_reason": "entropy_guard",
+                "collapse_reason": "entropy_not_collapsing",
+                "directional_entropy": 0.7,
                 "entropy_at_entry": 0.7,
+                "spread": 0.03,
                 "spread_at_entry": 0.03,
+                "volatility": 0.2,
                 "volatility_at_entry": 0.2,
+                "stability_ratio": 3.0,
                 "distance_to_boundary_at_entry": 2.8,
                 "entropy_slope_before_entry": -0.32,
             },
             {
                 "trade_outcome": "NO_TRADE",
                 "return": 0.0,
+                "seconds_to_expiry_at_entry": 33,
                 "signal_reason": "none",
+                "regime_label": "OSCILLATORY_NOISE",
                 "veto_reason": "spread_guard",
+                "collapse_reason": "spread_not_tight",
+                "directional_entropy": 0.64,
+                "spread": 0.07,
+                "volatility": 0.25,
+                "stability_ratio": 1.1,
             },
         ]
     )
@@ -57,7 +81,19 @@ def test_generate_simulation_report_with_trades():
     equity_curve = pd.DataFrame({"equity": [1000, 1010, 1020]})
 
     report = generate_simulation_report(
-        DummyOutput(telemetry=telemetry, trades=trades, equity_curve=equity_curve),
+        DummyOutput(
+            telemetry=telemetry,
+            trades=trades,
+            equity_curve=equity_curve,
+            dataset_diagnostics={
+                "api_source": "binance",
+                "api_limit_per_request": 1000,
+                "api_requests_used": 2,
+                "candles_loaded": 2200,
+                "expected_candles_for_range": 2400,
+                "data_truncation_detected": False,
+            },
+        ),
         {
             "dataset": "btc_binance_api",
             "start": datetime(2026, 3, 7, 6, 23),
@@ -76,18 +112,32 @@ def test_generate_simulation_report_with_trades():
         },
     )
 
-    assert "POLYSNIPE SIMULATION REPORT" in report
-    assert "Dataset: btc_binance_api" in report
-    assert "trade_count: 2" in report
-    assert "win_loss_ratio: 2.00" in report
-    assert "average_return: 1.00%" in report
-    assert "30s: 2" in report
-    assert "late_state_collapse: 2" in report
-    assert "PERSISTENT_COMPRESSION: 2" in report
-    assert "FILTER BLOCKERS" in report
-    assert "entropy_guard: 1" in report
-    assert "spread_guard: 1" in report
-    assert "entropy_slope_before_entry_mean: -0.2650" in report
+    assert "FEATURE DISTRIBUTION (ALL OBSERVATIONS)" in report
+    assert "entropy_95pct:" in report
+    assert "COLLAPSE BLOCKERS" in report
+    assert "entropy_not_collapsing: 1" in report
+    assert "spread_not_tight: 1" in report
+    assert "REGIME DISTRIBUTION (ALL OBSERVATIONS)" in report
+    assert "EVALUATION TIMING DISTRIBUTION" in report
+    assert "0-5: 1" in report
+    assert "10-20: 1" in report
+    assert "30+: 1" in report
+    assert "DATASET DIAGNOSTICS" in report
+    assert "api_limit_per_request: 1000" in report
+
+
+def test_generate_simulation_report_warning_when_no_collapse_signals():
+    telemetry = pd.DataFrame(
+        [
+            {"signal_reason": "none", "trade_outcome": "NO_TRADE", "seconds_to_expiry_at_entry": 12},
+            {"signal_reason": "none", "trade_outcome": "NO_TRADE", "seconds_to_expiry_at_entry": 14},
+        ]
+    )
+    report = generate_simulation_report(
+        DummyOutput(telemetry=telemetry, trades=pd.DataFrame(), equity_curve=pd.DataFrame()),
+        {},
+    )
+    assert "collapse_detector_never_triggered: true" in report
 
 
 def test_generate_simulation_report_handles_empty_frames():
