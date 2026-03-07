@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.metrics import brier_score_loss, mean_absolute_error, mean_squared_error, roc_auc_score
 
 from src.edge.cross_validation import chronological_split
 from src.edge.dataset_builder import EdgeDatasetBuilder, dataset_to_matrices
@@ -59,11 +59,15 @@ class ResearchEngine:
         self.state = EngineState(observations_seen=self.training_controller.training_step)
 
     def _evaluate(self, model: PersistenceModel, test_frame: pd.DataFrame) -> dict[str, float]:
-        X_test, y_test, _ = dataset_to_matrices(test_frame)
-        probs = model.predict_probabilities(X_test)
-        auc = float(roc_auc_score(y_test, probs)) if len(set(y_test)) > 1 else 0.5
-        brier = float(brier_score_loss(y_test, probs))
-        return {"roc_auc": auc, "brier": brier, "calibration": 1.0 - brier}
+        X_test, y_test, _ = dataset_to_matrices(test_frame, label_mode=model.label_mode)
+        signals = model.predict_signals(X_test)
+        if model.is_classifier:
+            auc = float(roc_auc_score(y_test, signals)) if len(set(y_test)) > 1 else 0.5
+            brier = float(brier_score_loss(y_test, signals))
+            return {"roc_auc": auc, "brier": brier, "calibration": 1.0 - brier}
+        mse = float(mean_squared_error(y_test, signals))
+        mae = float(mean_absolute_error(y_test, signals))
+        return {"mse": mse, "mae": mae}
 
     def _maybe_retrain(self) -> None:
         data = self.dataset_builder._load()
@@ -74,19 +78,23 @@ class ResearchEngine:
         if split.validation.empty or split.test.empty:
             return
 
-        opt = random_search_optimize(data)
+        opt = random_search_optimize(data, label_mode="persistence")
         candidate = PersistenceModel(
             model_type=opt.params.get("model_type", "logistic"),
             feature_scaling=opt.params.get("feature_scaling", True),
             random_state=42,
+            label_mode="persistence",
         )
-        X_train, y_train, _ = dataset_to_matrices(split.train)
+        X_train, y_train, _ = dataset_to_matrices(split.train, label_mode="persistence")
         candidate.fit(X_train, y_train)
 
         new_metrics = self._evaluate(candidate, split.test)
         old_metrics = self._evaluate(self.model, split.test) if self.state.deployed_model_path else {"roc_auc": 0.0, "brier": 1.0}
 
-        improved = (new_metrics["roc_auc"] > old_metrics.get("roc_auc", 0.0)) and (new_metrics["brier"] <= old_metrics.get("brier", 1.0))
+        if candidate.is_classifier:
+            improved = (new_metrics["roc_auc"] > old_metrics.get("roc_auc", 0.0)) and (new_metrics["brier"] <= old_metrics.get("brier", 1.0))
+        else:
+            improved = (new_metrics["mse"] < old_metrics.get("mse", float("inf"))) and (new_metrics["mae"] <= old_metrics.get("mae", float("inf")))
         if improved:
             ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
             model_path = Path("models") / f"persistence_model_v{ts}.pkl"
@@ -117,9 +125,9 @@ class ResearchEngine:
                 break
             observation = self.tape.next_tick()
             features = extract_features(observation)
-            probability = self.model.predict_probability(features.__dict__) if self.state.deployed_model_path else 0.5
+            signal = self.model.predict_signal(features.__dict__) if self.state.deployed_model_path else 0.5
             self.policy.dataset_size = self.state.observations_seen
-            _ = self.policy.evaluate(probability)
+            _ = self.policy.evaluate(signal)
 
             future_frame = self.tape.peek_future(self.horizon_ticks)
             future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
@@ -134,7 +142,7 @@ class ResearchEngine:
                 drift_10s_pct=drift_10s_pct,
                 timestamp=observation.get("timestamp"),
                 symbol=str(observation.get("symbol", "UNKNOWN")),
-                metadata={"probability": probability, "label_mode": "persistence", "target": persistence_label},
+                metadata={"signal": signal},
             )
 
             seen += 1

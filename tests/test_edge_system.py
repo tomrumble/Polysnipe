@@ -95,14 +95,33 @@ def test_dataset_builder_label_mode_routing(tmp_path: Path):
     assert all(row["label_mode"] == "drift" for row in drift_meta)
 
 
-def test_model_training_and_probability(tmp_path: Path):
+def test_model_training_and_signal(tmp_path: Path):
     data = build_edge_dataset(sample_telemetry(), dataset_path=tmp_path / "edge.parquet", append=False)
     X, y, _ = dataset_to_matrices(data)
     model = PersistenceModel(model_type="logistic", feature_scaling=True)
     model.fit(X, y)
-    p = model.predict_probability(X.iloc[[0]])
-    assert 0.0 <= p <= 1.0
+    signal = model.predict_signal(X.iloc[[0]])
+    assert 0.0 <= signal <= 1.0
 
+
+
+def test_regression_model_training_and_signal(tmp_path: Path):
+    data = build_edge_dataset(sample_telemetry(), dataset_path=tmp_path / "edge.parquet", append=False)
+    X, _, _ = dataset_to_matrices(data)
+    y = data["return"].astype(float)
+    model = PersistenceModel(model_type="random_forest_regressor", label_mode="drift")
+    model.fit(X, y)
+    signal = model.predict_signal(X.iloc[[0]])
+    assert isinstance(signal, float)
+
+
+def test_new_classifier_model_types(tmp_path: Path):
+    data = build_edge_dataset(sample_telemetry(), dataset_path=tmp_path / "edge.parquet", append=False)
+    X, y, _ = dataset_to_matrices(data)
+    model = PersistenceModel(model_type="random_forest_classifier")
+    model.fit(X, y)
+    signal = model.predict_signal(X.iloc[[0]])
+    assert 0.0 <= signal <= 1.0
 
 def test_policy_decision(monkeypatch):
     monkeypatch.setattr("src.edge.policy.random.random", lambda: 1.0)
