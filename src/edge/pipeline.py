@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sklearn.metrics import precision_score, recall_score, roc_auc_score
 
@@ -16,8 +17,11 @@ from src.edge.model import PersistenceModel
 from src.edge.optimizer import random_search_optimize
 
 
+LABEL_MODE = "persistence"
+
+
 def run_edge_pipeline(telemetry: pd.DataFrame) -> dict:
-    dataset = build_edge_dataset(telemetry)
+    dataset = build_edge_dataset(telemetry, label_mode=LABEL_MODE)
     split = chronological_split(dataset)
 
     opt = random_search_optimize(dataset)
@@ -38,6 +42,14 @@ def run_edge_pipeline(telemetry: pd.DataFrame) -> dict:
     valid_pred = (valid_probs >= threshold).astype(int)
     test_pred = (test_probs >= threshold).astype(int)
 
+    prob_summary = {
+        "min": float(np.min(test_probs)),
+        "mean": float(np.mean(test_probs)),
+        "max": float(np.max(test_probs)),
+        "p90": float(np.percentile(test_probs, 90)),
+        "p99": float(np.percentile(test_probs, 99)),
+    }
+
     metrics = {
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "best_params": opt.params,
@@ -54,6 +66,9 @@ def run_edge_pipeline(telemetry: pd.DataFrame) -> dict:
             "recall": float(recall_score(y_test, test_pred, zero_division=0)),
             "win_rate": float(y_test.mean()),
         },
+        "probability_summary": prob_summary,
+        "training_samples": int(len(X_train)),
+        "label_mode": LABEL_MODE,
     }
 
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")

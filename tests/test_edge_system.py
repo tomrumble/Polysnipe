@@ -45,6 +45,12 @@ def test_feature_extractor():
     assert fv.regime == 1
 
 
+def test_feature_extractor_sanitizes_non_finite_values():
+    fv = extract_features({"directional_entropy": float("nan"), "spread": float("inf")})
+    assert fv.entropy == 0.0
+    assert fv.spread == 0.0
+
+
 def test_dataset_builder(tmp_path: Path):
     ds_path = tmp_path / "edge.parquet"
     data = build_edge_dataset(sample_telemetry(), dataset_path=ds_path, append=False)
@@ -63,10 +69,18 @@ def test_model_training_and_probability(tmp_path: Path):
     assert 0.0 <= p <= 1.0
 
 
-def test_policy_decision():
-    policy = TradingPolicy(confidence_threshold=0.97)
+def test_policy_decision(monkeypatch):
+    monkeypatch.setattr("src.edge.policy.random.random", lambda: 1.0)
+    policy = TradingPolicy(confidence_threshold=0.97, dataset_size=0, exploration_enabled=True)
     assert policy.evaluate(0.99).enter is True
     assert policy.evaluate(0.5).enter is False
+
+
+def test_policy_exploitation_threshold(monkeypatch):
+    monkeypatch.setattr("src.edge.policy.random.random", lambda: 1.0)
+    policy = TradingPolicy(dataset_size=20000, exploration_enabled=True)
+    assert policy.evaluate(0.89).enter is False
+    assert policy.evaluate(0.91).enter is True
 
 
 def test_pipeline_stability(tmp_path: Path, monkeypatch):

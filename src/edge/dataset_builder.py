@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from src.features import FeatureVector, extract_features
-from src.labels import label_persistence
+from src.labels import label_persistence, label_short_horizon_move
 
 FEATURE_COLUMNS = [
     "entropy",
@@ -63,12 +64,24 @@ class EdgeDatasetBuilder:
         dedupe_cols = ["timestamp", "symbol", "features"]
         merged = merged.drop_duplicates(subset=dedupe_cols, keep="last")
         merged = merged.sort_values("timestamp").reset_index(drop=True)
+        merged = merged.replace([np.inf, -np.inf], np.nan)
+        merged = merged.dropna()
+        merged[FEATURE_COLUMNS] = merged[FEATURE_COLUMNS].astype(float)
         merged.to_parquet(self.dataset_path, index=False)
         return merged
 
-    def append_from_observation(self, observation: dict[str, Any], future_path: list[float]) -> pd.DataFrame:
+    def append_from_observation(
+        self,
+        observation: dict[str, Any],
+        future_path: list[float],
+        *,
+        label_mode: str = "persistence",
+    ) -> pd.DataFrame:
         fv = extract_features(observation)
-        outcome = int(label_persistence(observation, future_path))
+        if label_mode == "short_move":
+            outcome = int(label_short_horizon_move(observation, future_path))
+        else:
+            outcome = int(label_persistence(observation, future_path))
         return self.append(
             fv,
             outcome,
@@ -77,6 +90,7 @@ class EdgeDatasetBuilder:
             metadata={
                 "entry_price": observation.get("entry_price"),
                 "boundary_price": observation.get("boundary_price"),
+                "label_mode": label_mode,
             },
         )
 
@@ -85,6 +99,7 @@ def build_edge_dataset(
     telemetry: pd.DataFrame,
     dataset_path: str | Path = "datasets/edge_training_data.parquet",
     append: bool = True,
+    label_mode: str = "persistence",
 ) -> pd.DataFrame:
     builder = EdgeDatasetBuilder(dataset_path=dataset_path)
     if not append and Path(dataset_path).exists():
@@ -93,7 +108,7 @@ def build_edge_dataset(
     for row in telemetry.to_dict(orient="records"):
         raw_path = row.get("price_path_until_expiry", "[]")
         future_path = json.loads(raw_path) if isinstance(raw_path, str) else list(raw_path)
-        builder.append_from_observation(row, future_path)
+        builder.append_from_observation(row, future_path, label_mode=label_mode)
 
     return builder._load()
 
