@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sys
 
 import pandas as pd
@@ -12,6 +13,7 @@ from src.edge.optimizer import _objective
 from src.edge.pipeline import run_edge_pipeline
 from src.edge.policy import PolicySide, TradingPolicy
 from src.features import extract_features
+from src.labels import label_future_drift
 from ui.dashboard import compute_trade_return
 
 
@@ -60,19 +62,66 @@ def test_dataset_builder(tmp_path: Path):
     assert ds_path.exists()
     assert "return" in data.columns
     assert data["return"].nunique() > 1
+    assert {"persistence_label", "short_move_label", "drift_10s_pct", "timestamp"}.issubset(data.columns)
+
     X, y, meta = dataset_to_matrices(data)
     assert not X.empty
     assert len(y) == len(meta)
 
+    _, y_short, _ = dataset_to_matrices(data, label_mode="short_move")
+    _, y_drift, _ = dataset_to_matrices(data, label_mode="drift")
+    assert y_short.dtype.kind in {"i", "u"}
+    assert y_drift.dtype.kind == "f"
 
-def test_model_training_and_probability(tmp_path: Path):
+
+
+
+def test_dataset_builder_label_mode_routing(tmp_path: Path):
+    telemetry = sample_telemetry()
+
+    persistence_data = build_edge_dataset(telemetry, dataset_path=tmp_path / "edge_p.parquet", append=False, label_mode="persistence")
+    short_data = build_edge_dataset(telemetry, dataset_path=tmp_path / "edge_s.parquet", append=False, label_mode="short_move")
+    drift_data = build_edge_dataset(telemetry, dataset_path=tmp_path / "edge_d.parquet", append=False, label_mode="drift")
+
+    persistence_meta = persistence_data["metadata"].map(json.loads)
+    short_meta = short_data["metadata"].map(json.loads)
+    drift_meta = drift_data["metadata"].map(json.loads)
+
+    assert all(isinstance(row["target"], int) for row in persistence_meta)
+    assert all(isinstance(row["target"], int) for row in short_meta)
+    assert all(isinstance(row["target"], float) for row in drift_meta)
+    assert all(row["label_mode"] == "persistence" for row in persistence_meta)
+    assert all(row["label_mode"] == "short_move" for row in short_meta)
+    assert all(row["label_mode"] == "drift" for row in drift_meta)
+
+
+def test_model_training_and_signal(tmp_path: Path):
     data = build_edge_dataset(sample_telemetry(), dataset_path=tmp_path / "edge.parquet", append=False)
     X, y, _ = dataset_to_matrices(data)
     model = PersistenceModel(model_type="logistic", feature_scaling=True)
     model.fit(X, y)
-    p = model.predict_probability(X.iloc[[0]])
-    assert 0.0 <= p <= 1.0
+    signal = model.predict_signal(X.iloc[[0]])
+    assert 0.0 <= signal <= 1.0
 
+
+
+def test_regression_model_training_and_signal(tmp_path: Path):
+    data = build_edge_dataset(sample_telemetry(), dataset_path=tmp_path / "edge.parquet", append=False)
+    X, _, _ = dataset_to_matrices(data)
+    y = data["return"].astype(float)
+    model = PersistenceModel(model_type="random_forest_regressor", label_mode="drift")
+    model.fit(X, y)
+    signal = model.predict_signal(X.iloc[[0]])
+    assert isinstance(signal, float)
+
+
+def test_new_classifier_model_types(tmp_path: Path):
+    data = build_edge_dataset(sample_telemetry(), dataset_path=tmp_path / "edge.parquet", append=False)
+    X, y, _ = dataset_to_matrices(data)
+    model = PersistenceModel(model_type="random_forest_classifier")
+    model.fit(X, y)
+    signal = model.predict_signal(X.iloc[[0]])
+    assert 0.0 <= signal <= 1.0
 
 def test_policy_decision(monkeypatch):
     monkeypatch.setattr("src.edge.policy.random.random", lambda: 1.0)
@@ -165,3 +214,18 @@ def test_compute_trade_return_varies_with_market_path():
     assert len(set(returns)) > 1
     assert returns[0] == pytest.approx(0.9495)
     assert returns[1] == pytest.approx(-1.0005)
+
+
+def test_label_future_drift_bounds_horizon():
+    observation = {"entry_price": 100.0}
+    future_path = [100.5, 101.0]
+
+    assert label_future_drift(observation, future_path, horizon=10) == pytest.approx(0.01)
+
+
+def test_dataset_builder_drift_mode_persists_drift_column(tmp_path: Path):
+    ds_path = tmp_path / "edge_drift.parquet"
+    data = build_edge_dataset(sample_telemetry(), dataset_path=ds_path, append=False, label_mode="drift")
+
+    assert "drift_10s_pct" in data.columns
+    assert data["drift_10s_pct"].notna().all()
