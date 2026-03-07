@@ -39,19 +39,18 @@ class ResearchEngine:
         retrain_interval: int = 10_000,
         horizon_ticks: int = 60,
         confidence_threshold: float = 0.97,
-        training_controller: TrainingController | None = None,
+        policy_mode: str = "persistence",
+        drift_threshold: float = 0.001,
     ) -> None:
         self.tape = tape
         self.dataset_builder = dataset_builder or EdgeDatasetBuilder()
         self.retrain_interval = retrain_interval
         self.horizon_ticks = horizon_ticks
-        self.policy = TradingPolicy(confidence_threshold=confidence_threshold)
-        self.training_controller = training_controller or TrainingController.load()
-        self.training_controller.sync_from_artifacts(
-            dataset_path=self.dataset_builder.dataset_path,
-            latest_model_path="models/latest_persistence_model.pkl",
+        self.policy = TradingPolicy(
+            confidence_threshold=confidence_threshold,
+            mode=policy_mode,
+            drift_threshold=drift_threshold,
         )
-
         self.model: PersistenceModel = PersistenceModel()
         latest_model_path = Path("models/latest_persistence_model.pkl")
         if latest_model_path.exists():
@@ -127,7 +126,7 @@ class ResearchEngine:
             features = extract_features(observation)
             signal = self.model.predict_signal(features.__dict__) if self.state.deployed_model_path else 0.5
             self.policy.dataset_size = self.state.observations_seen
-            _ = self.policy.evaluate(signal)
+            policy_decision = self.policy.evaluate(probability)
 
             future_frame = self.tape.peek_future(self.horizon_ticks)
             future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
@@ -142,7 +141,12 @@ class ResearchEngine:
                 drift_10s_pct=drift_10s_pct,
                 timestamp=observation.get("timestamp"),
                 symbol=str(observation.get("symbol", "UNKNOWN")),
-                metadata={"signal": signal},
+                metadata={
+                    "probability": probability,
+                    "policy_signal_score": policy_decision.signal_score,
+                    "policy_side": policy_decision.side.value,
+                    "policy_enter": policy_decision.enter,
+                },
             )
 
             seen += 1

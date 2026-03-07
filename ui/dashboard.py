@@ -27,6 +27,7 @@ from src.edge.policy import (
     EXPLORATION_THRESHOLD,
     EXPLOITATION_THRESHOLD,
     MIN_EXPLORATION_SAMPLES,
+    PolicySide,
     TradingPolicy,
 )
 from src.engine import ResearchEngine, TrainingController, TrainingLifecycleState
@@ -330,7 +331,8 @@ class ReplaySimulator:
             if self.edge_model is not None:
                 model_probability = self.edge_model.predict_signal(features)
             self.policy.dataset_size = i
-            policy_decision = self.policy.evaluate(model_probability)
+            predicted_drift = float(path[i + 1] - path[i]) if i + 1 < len(path) else 0.0
+            policy_decision = self.policy.evaluate(model_probability, predicted_drift=predicted_drift)
 
             guard_accel_fail = self.heuristic_guards["acceleration_veto"] and abs(accel) > 3.5
             guard_spread_fail = self.heuristic_guards["spread_veto"] and spread > 0.22
@@ -338,7 +340,7 @@ class ReplaySimulator:
             guard_osc_fail = self.heuristic_guards["oscillation_veto"] and np.sign(path[i] - path[i - 1]) != np.sign(path[i - 1] - path[i - 2])
             heuristic_blocked = guard_accel_fail or guard_spread_fail or guard_vol_fail or guard_osc_fail
 
-            should_trade = policy_decision.enter and not heuristic_blocked
+            should_trade = policy_decision.enter and policy_decision.side != PolicySide.NONE and not heuristic_blocked
             veto_reason = ""
             if not policy_decision.enter:
                 veto_reason = "policy_threshold"
@@ -352,7 +354,12 @@ class ReplaySimulator:
             min_price_until_expiry = float(np.min(future_path)) if len(future_path) else current_price
             expiry_iso = timestamps[expiry_idx].isoformat()
 
-            trade_direction = "UP" if boundary_side > 0 else "DOWN"
+            if policy_decision.side == PolicySide.SHORT:
+                trade_direction = "DOWN"
+            elif policy_decision.side == PolicySide.LONG:
+                trade_direction = "UP"
+            else:
+                trade_direction = "UP" if boundary_side > 0 else "DOWN"
 
             trade_outcome = "NO_TRADE"
             trade_return = 0.0
@@ -403,6 +410,9 @@ class ReplaySimulator:
                 "spread_at_entry": spread,
                 "price_acceleration": accel,
                 "persistence_probability": model_probability,
+                "policy_signal_score": policy_decision.signal_score,
+                "policy_side": policy_decision.side.value,
+                "policy_enter": policy_decision.enter,
                 "regime_label": regime.value,
                 "signal_reason": signal_reason,
                 "veto_reason": veto_reason,
