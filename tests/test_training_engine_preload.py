@@ -38,7 +38,7 @@ def test_training_engine_step_consumes_one_preloaded_observation(tmp_path: Path)
                 "seconds_remaining": 10,
                 "distance_to_boundary": 1.0,
                 "regime_label": 0,
-                "label_persistence": 1,
+                "label_persistence": 0 if i == 0 else 1,
                 "label_drift": 0.0,
                 "close": 100 + i,
                 "open": 100 + i,
@@ -93,7 +93,7 @@ def test_preloaded_dataset_is_normalized_for_labels_and_metrics(tmp_path: Path):
         {
             "timestamp": pd.Timestamp("2024-01-01T00:00:01Z"),
             "price": 101,
-            "entropy": None,
+            "entropy": 0.2,
             "entropy_slope": 0.0,
             "spread": 0.01,
             "volatility": 0.1,
@@ -109,7 +109,117 @@ def test_preloaded_dataset_is_normalized_for_labels_and_metrics(tmp_path: Path):
     ]
 
     engine.load_dataset(records, precomputed_features=True)
-    assert engine.state.dataset_size == 1  # second row dropped as unusable feature row
+    assert engine.state.dataset_size == 2
     engine._recompute_metrics()
-    assert engine.state.latest_metrics["dataset_size"] == 1
-    assert engine.state.latest_metrics["positive_rate"] == 1.0
+    assert engine.state.latest_metrics["dataset_size"] == 2
+    assert engine.state.latest_metrics["positive_rate"] == 0.5
+
+
+def test_preloaded_dataset_normalizes_label_aliases(tmp_path: Path):
+    raw = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="s", tz="UTC"),
+            "close": [100, 101, 102, 103],
+        }
+    )
+    raw_path = tmp_path / "raw.parquet"
+    raw.to_parquet(raw_path, index=False)
+
+    tape = MarketTape(raw_path)
+    engine = TrainingEngine(tape=tape, retrain_interval=1000, metric_interval=1)
+
+    records = [
+        {
+            "timestamp": pd.Timestamp("2024-01-01T00:00:00Z"),
+            "price": 100,
+            "entropy": 0.1,
+            "entropy_slope": 0.0,
+            "spread": 0.01,
+            "volatility": 0.1,
+            "volatility_slope": 0.0,
+            "stability_ratio": 2.0,
+            "acceleration": 0.0,
+            "seconds_remaining": 10,
+            "distance_to_boundary": 1.0,
+            "regime_label": 0,
+            "persistence_label": 1,
+            "label_drift": 0.01,
+        },
+        {
+            "timestamp": pd.Timestamp("2024-01-01T00:00:01Z"),
+            "price": 101,
+            "entropy": 0.2,
+            "entropy_slope": 0.0,
+            "spread": 0.01,
+            "volatility": 0.1,
+            "volatility_slope": 0.0,
+            "stability_ratio": 2.0,
+            "acceleration": 0.0,
+            "seconds_remaining": 10,
+            "distance_to_boundary": 1.0,
+            "regime_label": 0,
+            "persistence_outcome": 0,
+            "label_drift": -0.01,
+        },
+    ]
+
+    engine.load_dataset(records, precomputed_features=True)
+
+    assert engine.state.dataset_size == 2
+    assert {row["label_persistence"] for row in engine.records} == {0, 1}
+
+
+def test_preloaded_dataset_rejects_constant_labels(tmp_path: Path):
+    raw = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="s", tz="UTC"),
+            "close": [100, 101, 102, 103],
+        }
+    )
+    raw_path = tmp_path / "raw.parquet"
+    raw.to_parquet(raw_path, index=False)
+
+    tape = MarketTape(raw_path)
+    engine = TrainingEngine(tape=tape, retrain_interval=1000, metric_interval=1)
+
+    records = [
+        {
+            "timestamp": pd.Timestamp("2024-01-01T00:00:00Z"),
+            "price": 100,
+            "entropy": 0.1,
+            "entropy_slope": 0.0,
+            "spread": 0.01,
+            "volatility": 0.1,
+            "volatility_slope": 0.0,
+            "stability_ratio": 2.0,
+            "acceleration": 0.0,
+            "seconds_remaining": 10,
+            "distance_to_boundary": 1.0,
+            "regime_label": 0,
+            "label": 1,
+            "label_drift": 0.01,
+        },
+        {
+            "timestamp": pd.Timestamp("2024-01-01T00:00:01Z"),
+            "price": 101,
+            "entropy": 0.2,
+            "entropy_slope": 0.0,
+            "spread": 0.01,
+            "volatility": 0.1,
+            "volatility_slope": 0.0,
+            "stability_ratio": 2.0,
+            "acceleration": 0.0,
+            "seconds_remaining": 10,
+            "distance_to_boundary": 1.0,
+            "regime_label": 0,
+            "label": 1,
+            "label_drift": -0.01,
+        },
+    ]
+
+    try:
+        engine.load_dataset(records, precomputed_features=True)
+    except ValueError as exc:
+        assert "Dataset labels are constant" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for single-class dataset")
