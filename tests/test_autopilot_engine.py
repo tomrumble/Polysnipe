@@ -90,3 +90,47 @@ def test_market_tape_and_research_engine_loop(tmp_path: Path):
 
     assert state.observations_seen == 120
     assert Path("datasets/edge_training_data.parquet").exists()
+
+
+
+def test_retrain_cadence_is_deterministic(tmp_path: Path, monkeypatch):
+    market = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=30, freq="s", tz="UTC"),
+            "close": [100 + i * 0.01 for i in range(30)],
+            "entry_price": [100.0] * 30,
+            "boundary_price": [105.0] * 30,
+            "directional_entropy": [0.2] * 30,
+            "entropy_velocity": [0.0] * 30,
+            "spread": [0.01] * 30,
+            "volatility": [0.03] * 30,
+            "volatility_slope": [0.0] * 30,
+            "stability_ratio": [2.0] * 30,
+            "price_acceleration": [0.0] * 30,
+            "seconds_remaining": [10] * 30,
+            "distance_to_boundary": [5.0] * 30,
+            "regime_label": ["PERSISTENT_COMPRESSION"] * 30,
+            "symbol": ["BTCUSDT"] * 30,
+        }
+    )
+    tape_path = tmp_path / "tape_small.parquet"
+    market.to_parquet(tape_path, index=False)
+
+    monkeypatch.chdir(tmp_path)
+    tape = MarketTape(tape_path)
+    engine = ResearchEngine(tape=tape, retrain_interval=5, min_training_samples=10)
+
+    calls = {"n": 0}
+
+    def fake_retrain() -> None:
+        if engine.state.observations_seen - engine.state.last_retrain_observation < engine.retrain_interval:
+            return
+        engine.state.last_retrain_observation = engine.state.observations_seen
+        calls["n"] += 1
+
+    monkeypatch.setattr(engine, "_maybe_retrain", fake_retrain)
+    state = engine.run(max_ticks=23)
+
+    assert state.observations_seen == 23
+    assert calls["n"] == 4
+    assert state.last_retrain_observation == 20

@@ -1,3 +1,3 @@
-from src.engine.research_engine import ResearchEngine
+from src.engine.research_engine import FixedTrainingConfig, ResearchEngine
 
-__all__ = ["ResearchEngine"]
+__all__ = ["ResearchEngine", "FixedTrainingConfig"]
