@@ -725,6 +725,17 @@ def _resolve_speed_delay(simulation_speed: str) -> float:
     return delays.get(simulation_speed, 0.06)
 
 
+def _line_fig(df: pd.DataFrame, x: str, y: str, title: str, height: int = 180) -> go.Figure:
+    """Plotly line chart from dataframe; uses single (0,0) point when empty to avoid Vega-Lite extent errors."""
+    if df.empty or y not in df.columns:
+        df = pd.DataFrame({x: [0], y: [0.0]})
+    elif x != "step" and x not in df.columns:
+        df = pd.DataFrame({x: [0], y: [0.0]})
+    fig = go.Figure(go.Scatter(x=df[x], y=df[y], mode="lines"))
+    fig.update_layout(title=title, height=height, margin=dict(t=40, b=30, l=40, r=20))
+    return fig
+
+
 def _init_live_state() -> None:
     defaults = {
         "live_engine": None,
@@ -882,6 +893,8 @@ def main() -> None:
         st.session_state["event_log"] = []
         st.session_state["run_error"] = ""
 
+    # Fixed slot for error so main() always has same block count (avoids setIn index mismatch when fragment runs).
+    error_ph = st.empty()
     if st.session_state.get("run_error"):
         st.error(st.session_state["run_error"])
 
@@ -920,56 +933,57 @@ def main() -> None:
 
     @st.fragment(run_every=delta_sec)
     def live_simulation_panel():
-        ph = st.session_state.get("_ph")
-        if not ph:
+        ph = st.session_state.get("_live_panel_ph")
+        if ph is None:
             return
         target = int(st.session_state["target_samples"])
         speed = st.session_state.get("simulation_speed", "10x")
         chart_every = st.session_state.get("chart_update_every_n_steps", 25)
+        delay = _resolve_speed_delay(speed)
 
-        with ph["controls"].container():
+        with ph.container():
+            panel = st.session_state.get("dataset_panel", {})
+            st.subheader("Dataset Panel")
+            d1, d2, d3, d4, d5 = st.columns(5)
+            d1.metric("dataset_name", str(panel.get("dataset_name", dataset)))
+            d2.metric("dataset_source", str(panel.get("dataset_source", resolve_dataset_route(dataset).source)))
+            d3.metric("feature_version", str(panel.get("feature_version", "v1")))
+            d4.metric("samples", f"{int(panel.get('samples', 0)):,}")
+            d5.metric("last_updated", str(panel.get("last_updated", "-"))[:19])
+
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Target Samples", f"{target:,}")
             c2.metric("Processed", f"{st.session_state['processed_steps']:,}")
             c3.metric("Simulation Speed", speed)
             c4.metric("Runtime", "RUNNING" if st.session_state["running"] else "PAUSED")
 
-        engine = st.session_state.get("live_engine")
-        if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target:
-            engine.start()
+            engine = st.session_state.get("live_engine")
+            if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target:
+                engine.start()
+                steps_per_refresh = max(1, int(0.2 / max(0.01, delay))) if delay > 0 else 20
+                steps_per_refresh = min(steps_per_refresh, 20)
+                for _ in range(steps_per_refresh):
+                    if st.session_state["processed_steps"] >= target:
+                        st.session_state["running"] = False
+                        _push_event("Target sample size reached")
+                        break
 
-            steps_per_refresh = 1 if speed in {"1x", "5x"} else 5
-            for _ in range(steps_per_refresh):
-                if st.session_state["processed_steps"] >= target:
-                    st.session_state["running"] = False
-                    _push_event("Target sample size reached")
-                    break
+                    snapshot = engine.step()
+                    if snapshot is None:
+                        st.session_state["running"] = False
+                        _push_event("Market tape exhausted")
+                        break
 
-                snapshot = engine.step()
-                if snapshot is None:
-                    st.session_state["running"] = False
-                    _push_event("Market tape exhausted")
-                    break
-
-                st.session_state["processed_steps"] = snapshot.step_index
-                st.session_state["market_candles"].append(snapshot.candle)
-                st.session_state["market_candles"] = st.session_state["market_candles"][-200:]
-                st.session_state["dataset_growth"].append({"step": snapshot.step_index, "dataset_size": snapshot.dataset_size})
-                st.session_state["edge_history"].append({"step": snapshot.step_index, "edge_score": snapshot.edge_score})
-                st.session_state["spearman_history"].append({"step": snapshot.step_index, "spearman": snapshot.spearman_rank_correlation})
-                st.session_state["calibration_history"].append({"step": snapshot.step_index, "calibration": snapshot.calibration_error})
-                st.session_state["signal_history"].append({"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal})
-                st.session_state["signal_outcome_history"].append(
-                    {"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal, "outcome": snapshot.outcome_label}
-                )
-
-                _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
-                _push_event(f"Feature vector generated: {snapshot.feature_vector}")
-                if snapshot.trade_executed:
-                    _push_event(f"Trade executed ({snapshot.trade_result})")
-                if snapshot.retrain_event:
-                    _push_event(
-                        f"Step {snapshot.step_index}: Retraining model | Edge={snapshot.edge_score:.3f} Spearman={snapshot.spearman_rank_correlation:.3f}"
+                    st.session_state["processed_steps"] = snapshot.step_index
+                    st.session_state["market_candles"].append(snapshot.candle)
+                    st.session_state["market_candles"] = st.session_state["market_candles"][-200:]
+                    st.session_state["dataset_growth"].append({"step": snapshot.step_index, "dataset_size": snapshot.dataset_size})
+                    st.session_state["edge_history"].append({"step": snapshot.step_index, "edge_score": snapshot.edge_score})
+                    st.session_state["spearman_history"].append({"step": snapshot.step_index, "spearman": snapshot.spearman_rank_correlation})
+                    st.session_state["calibration_history"].append({"step": snapshot.step_index, "calibration": snapshot.calibration_error})
+                    st.session_state["signal_history"].append({"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal})
+                    st.session_state["signal_outcome_history"].append(
+                        {"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal, "outcome": snapshot.outcome_label}
                     )
                     st.session_state["feature_importance"] = snapshot.feature_importance
 
@@ -992,13 +1006,44 @@ def main() -> None:
             fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
             ph["market_chart"].plotly_chart(fig, use_container_width=True)
 
-        edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
-        spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
-        calibration_value = st.session_state["calibration_history"][-1]["calibration"] if st.session_state["calibration_history"] else 1.0
-        dataset_size = st.session_state["dataset_growth"][-1]["dataset_size"] if st.session_state["dataset_growth"] else 0
-        trade_count = engine.state.latest_metrics.get("trade_count", 0) if engine is not None else 0
+                    _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
+                    _push_event(f"Feature vector generated: {snapshot.feature_vector}")
+                    if snapshot.trade_executed:
+                        _push_event(f"Trade executed ({snapshot.trade_result})")
+                    if snapshot.retrain_event:
+                        _push_event(
+                            f"Step {snapshot.step_index}: Retraining model | Edge={snapshot.edge_score:.3f} Spearman={snapshot.spearman_rank_correlation:.3f}"
+                        )
+                        st.session_state["feature_importance"] = snapshot.feature_importance
 
-        with ph["metrics"].container():
+                    panel = st.session_state.get("dataset_panel", {})
+                    panel["samples"] = int(max(panel.get("samples", 0), snapshot.dataset_size))
+                    panel["last_updated"] = datetime.now().isoformat()
+                    st.session_state["dataset_panel"] = panel
+
+            candles_df = pd.DataFrame(st.session_state["market_candles"])
+            if not candles_df.empty:
+                fig = go.Figure(
+                    data=[go.Candlestick(
+                        x=pd.to_datetime(candles_df["timestamp"]),
+                        open=candles_df["open"],
+                        high=candles_df["high"],
+                        low=candles_df["low"],
+                        close=candles_df["close"],
+                    )]
+                )
+                fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
+            else:
+                fig = go.Figure()
+                fig.update_layout(title="Market Replay (Rolling 200 Candles)", height=320)
+            st.plotly_chart(fig, use_container_width=True)
+
+            edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
+            spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
+            calibration_value = st.session_state["calibration_history"][-1]["calibration"] if st.session_state["calibration_history"] else 1.0
+            dataset_size = st.session_state["dataset_growth"][-1]["dataset_size"] if st.session_state["dataset_growth"] else 0
+            trade_count = engine.state.latest_metrics.get("trade_count", 0) if engine is not None else 0
+
             st.subheader("Live Learning Metrics")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("edge_score", f"{edge_value:.3f}")
@@ -1007,64 +1052,57 @@ def main() -> None:
             m4.metric("dataset_size", f"{dataset_size:,}")
             m5.metric("trade_count", f"{int(trade_count)}")
 
-        if st.session_state["processed_steps"] % chart_every == 0 or not st.session_state["running"]:
             growth = pd.DataFrame(st.session_state["dataset_growth"])
             edge_hist = pd.DataFrame(st.session_state["edge_history"])
             spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
             calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
             signal_hist = pd.DataFrame(st.session_state["signal_history"])
             signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
-            with ph["learning_charts"].container():
-                st.subheader("Learning Curves")
-                if not growth.empty:
-                    st.line_chart(growth.set_index("step")["dataset_size"], height=180)
-                c1, c2, c3 = st.columns(3)
-                if not edge_hist.empty:
-                    c1.line_chart(edge_hist.set_index("step")["edge_score"], height=180)
-                if not spearman_hist.empty:
-                    c2.line_chart(spearman_hist.set_index("step")["spearman"], height=180)
-                if not calibration_hist.empty:
-                    c3.line_chart(calibration_hist.set_index("step")["calibration"], height=180)
-
-                s1, s2 = st.columns(2)
-                if not signal_hist.empty:
-                    s1.plotly_chart(
-                        px.histogram(
-                            signal_hist,
-                            x="predicted_signal",
-                            nbins=30,
-                            title="Predicted Signal Distribution",
-                        ),
-                        use_container_width=True,
-                    )
-                if not signal_outcomes.empty:
-                    binned = signal_outcomes.copy()
-                    binned["signal_bucket"] = pd.cut(
-                        binned["predicted_signal"],
-                        bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.00001],
-                        labels=["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
-                        include_lowest=True,
-                    )
-                    relation = (
-                        binned.groupby("signal_bucket", observed=False)["outcome"]
-                        .mean()
-                        .reset_index()
-                        .rename(columns={"outcome": "success_rate"})
-                    )
-                    s2.plotly_chart(
-                        px.bar(relation, x="signal_bucket", y="success_rate", title="Predicted Signal vs Outcome"),
-                        use_container_width=True,
-                    )
-
-        with ph["feature_panel"].container():
-            st.subheader("Top Features (latest retrain)")
-            if st.session_state["feature_importance"]:
-                feature_df = pd.DataFrame(st.session_state["feature_importance"], columns=["feature", "importance"])
-                st.dataframe(feature_df, use_container_width=True, hide_index=True)
+            st.subheader("Learning Curves")
+            growth_plot = growth.rename(columns={"dataset_size": "y"})[["step", "y"]] if not growth.empty and "dataset_size" in growth.columns else pd.DataFrame({"step": [0], "y": [0.0]})
+            st.plotly_chart(_line_fig(growth_plot, "step", "y", "Dataset size", 180), use_container_width=True)
+            c1, c2, c3 = st.columns(3)
+            c1.plotly_chart(_line_fig(edge_hist, "step", "edge_score", "Edge score", 180), use_container_width=True)
+            c2.plotly_chart(_line_fig(spearman_hist, "step", "spearman", "Spearman", 180), use_container_width=True)
+            c3.plotly_chart(_line_fig(calibration_hist, "step", "calibration", "Calibration error", 180), use_container_width=True)
+            s1, s2 = st.columns(2)
+            sig_hist = signal_hist if not signal_hist.empty else pd.DataFrame({"predicted_signal": [0.0]})
+            s1.plotly_chart(
+                px.histogram(sig_hist, x="predicted_signal", nbins=30, title="Predicted Signal Distribution"),
+                use_container_width=True,
+            )
+            if not signal_outcomes.empty:
+                binned = signal_outcomes.copy()
+                binned["signal_bucket"] = pd.cut(
+                    binned["predicted_signal"],
+                    bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.00001],
+                    labels=["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
+                    include_lowest=True,
+                )
+                relation = (
+                    binned.groupby("signal_bucket", observed=False)["outcome"]
+                    .mean()
+                    .reset_index()
+                    .rename(columns={"outcome": "success_rate"})
+                )
+                s2.plotly_chart(
+                    px.bar(relation, x="signal_bucket", y="success_rate", title="Predicted Signal vs Outcome"),
+                    use_container_width=True,
+                )
             else:
-                st.caption("Feature importance will appear after first retrain event.")
+                s2.plotly_chart(
+                    px.bar(pd.DataFrame({"signal_bucket": ["0.0-0.2"], "success_rate": [0.0]}), x="signal_bucket", y="success_rate", title="Predicted Signal vs Outcome"),
+                    use_container_width=True,
+                )
 
-        with ph["event_log"].container():
+            st.subheader("Top Features (latest retrain)")
+            feature_df = (
+                pd.DataFrame(st.session_state["feature_importance"], columns=["feature", "importance"])
+                if st.session_state["feature_importance"]
+                else pd.DataFrame(columns=["feature", "importance"])
+            )
+            st.dataframe(feature_df, use_container_width=True, hide_index=True)
+
             st.subheader("Event Log")
             st.text("\n".join(st.session_state["event_log"][-60:]))
 
