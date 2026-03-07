@@ -15,6 +15,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 import base64
+import time
 import json
 import os
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -708,486 +710,267 @@ def _window_stability(trade_curve: pd.DataFrame, windows: list[int]) -> pd.DataF
     return pd.DataFrame(rows)
 
 
+def _resolve_speed_delay(simulation_speed: str) -> float:
+    delays = {"1x": 0.30, "5x": 0.12, "10x": 0.06, "50x": 0.015, "100x": 0.0}
+    return delays.get(simulation_speed, 0.06)
+
+
+def _init_live_state() -> None:
+    defaults = {
+        "live_engine": None,
+        "live_tape": None,
+        "running": False,
+        "target_samples": 50_000,
+        "processed_steps": 0,
+        "market_candles": [],
+        "dataset_growth": [],
+        "edge_history": [],
+        "spearman_history": [],
+        "calibration_history": [],
+        "signal_history": [],
+        "signal_outcome_history": [],
+        "event_log": [],
+        "feature_importance": [],
+        "run_error": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _build_live_engine(dataset: str) -> TrainingEngine:
+    dataset_route = resolve_dataset_route(dataset)
+    if dataset_route.loader_name == "synthetic":
+        raise RuntimeError("Live training requires a parquet-backed dataset (btc_binance_parquet or eth_binance_parquet).")
+
+    parquet_path = _project_root / (dataset_route.path or f"datasets/binance/{dataset_route.symbol}_1s.parquet")
+    if not parquet_path.exists():
+        raise RuntimeError(f"Dataset not found: {parquet_path}. Run ingestion first.")
+
+    tape = MarketTape(str(parquet_path))
+    engine = TrainingEngine(
+        tape=tape,
+        dataset_builder=EdgeDatasetBuilder(),
+        retrain_interval=1000,
+        metric_interval=50,
+        horizon_ticks=60,
+    )
+    engine.start()
+    st.session_state["live_tape"] = tape
+    return engine
+
+
+def _push_event(message: str) -> None:
+    st.session_state["event_log"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+    st.session_state["event_log"] = st.session_state["event_log"][-200:]
+
+
 def main() -> None:
     st.set_page_config(page_title="Edge Validation Panel", layout="wide")
     st.title("Edge Validation")
-    st.caption("Scientific instrument panel for statistically defensible edge validation")
+    st.caption("Live scientific instrument panel for observing real-time learning")
 
-    # NOTE:
-    # We intentionally avoid hard browser reloads here. The previous implementation
-    # injected `window.parent.location.reload()` on a timer, which recreates the
-    # Streamlit browser session and clears button-triggered run state. For longer
-    # training windows this could reset the app back to its initial load state
-    # without surfacing an error.
-    metric_interval = max(1, int(os.getenv("METRIC_INTERVAL", "30")))
+    _init_live_state()
 
     st.sidebar.header("SIMULATOR CONTROL")
-    dataset = st.sidebar.selectbox(
-        "dataset selector",
-        ["btc_binance_parquet", "eth_binance_parquet", "btc_binance_api", "eth_binance_api", "synthetic"],
-        help="Training engine requires a parquet dataset (e.g. btc_binance_parquet). Run data ingestion first to create datasets/binance/*.parquet.",
-    )
+    dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_parquet", "eth_binance_parquet", "btc_binance_api", "eth_binance_api", "synthetic"])
+    target_samples = int(st.sidebar.number_input("target_samples", min_value=100, value=int(st.session_state["target_samples"]), step=1000))
+    simulation_speed = st.sidebar.selectbox("simulation_speed", ["1x", "5x", "10x", "50x", "100x"], index=2)
+    chart_update_every = int(st.sidebar.number_input("chart_update_every_n_steps", min_value=1, max_value=100, value=25, step=1))
 
-    now = datetime.now().replace(microsecond=0)
-    start_default = now - timedelta(hours=1)
-    end_default = now
+    b1, b2, b3 = st.sidebar.columns(3)
+    start_clicked = b1.button("Start Simulation", type="primary", use_container_width=True)
+    pause_clicked = b2.button("Pause Simulation", use_container_width=True)
+    reset_clicked = b3.button("Reset", use_container_width=True)
 
-    if "start_date" not in st.session_state:
-        st.session_state["start_date"] = start_default.date()
-    if "start_time" not in st.session_state:
-        st.session_state["start_time"] = start_default.time()
-    if "end_date" not in st.session_state:
-        st.session_state["end_date"] = end_default.date()
-    if "end_time" not in st.session_state:
-        st.session_state["end_time"] = end_default.time()
-
-    start_date = st.sidebar.date_input("start date", value=st.session_state["start_date"], key="start_date")
-    start_clock = st.sidebar.time_input("start time", value=st.session_state["start_time"], key="start_time")
-    end_date = st.sidebar.date_input("end date", value=st.session_state["end_date"], key="end_date")
-    end_clock = st.sidebar.time_input("end time", value=st.session_state["end_time"], key="end_time")
-
-    stream_count = st.sidebar.slider("stream_count", min_value=1, max_value=20, value=4)
-    total_capital = st.sidebar.number_input("total_capital", min_value=100.0, value=1000.0, step=100.0)
-    transaction_cost = st.sidebar.number_input("transaction_cost_per_trade", min_value=0.0, max_value=0.01, value=0.0005, step=0.0001, format="%.4f")
-    persistence_mode = st.sidebar.selectbox("persistence mode", ["model", "empirical"], index=0)
-    api_limit = st.sidebar.number_input("binance api candle limit", min_value=24, max_value=1000, value=600, step=1)
-
-    st.sidebar.subheader("state-collapse parameters")
-    stability_ratio_threshold = st.sidebar.slider("stability_ratio_threshold", min_value=0.5, max_value=6.0, value=2.0, step=0.1)
-    entropy_threshold = st.sidebar.slider("entropy_threshold", min_value=0.05, max_value=0.69, value=0.62, step=0.01)
-    accel_threshold = st.sidebar.slider("accel_threshold", min_value=0.05, max_value=2.0, value=0.45, step=0.05)
-    spread_threshold = st.sidebar.slider("spread_threshold", min_value=0.005, max_value=0.05, value=0.02, step=0.001)
-
-    st.sidebar.subheader("heuristic guard toggles")
-    heuristics = {
-        "acceleration_veto": st.sidebar.checkbox("acceleration_veto", value=True),
-        "oscillation_veto": st.sidebar.checkbox("oscillation_veto", value=True),
-        "spread_veto": st.sidebar.checkbox("spread_veto", value=True),
-        "volatility_spike_veto": st.sidebar.checkbox("volatility_spike_veto", value=True),
-    }
-
-    include_simulation = st.sidebar.checkbox("Enable replay simulation section", value=False)
-    run_clicked = st.sidebar.button("Run Training Engine", type="primary")
-
-    if "sim_outputs" not in st.session_state:
-        st.session_state["sim_outputs"] = None
-    if "last_simulation_output" not in st.session_state:
-        st.session_state["last_simulation_output"] = None
-    if "last_simulation_config" not in st.session_state:
-        st.session_state["last_simulation_config"] = None
-    if "run_error" not in st.session_state:
+    if start_clicked:
+        st.session_state["target_samples"] = target_samples
         st.session_state["run_error"] = ""
-    if "engine_state" not in st.session_state:
-        st.session_state["engine_state"] = None
-    if "last_run_started_at" not in st.session_state:
-        st.session_state["last_run_started_at"] = None
-
-    if run_clicked:
-        start_dt = datetime.combine(start_date, start_clock)
-        end_dt = datetime.combine(end_date, end_clock)
-        if end_dt <= start_dt:
-            st.session_state["run_error"] = "End time must be after start time."
-            st.session_state["sim_outputs"] = None
-            st.session_state["engine_state"] = None
-        else:
-            st.session_state["last_run_started_at"] = datetime.now()
-            engine = None
-
+        if st.session_state["live_engine"] is None:
             try:
-                dataset_route = resolve_dataset_route(dataset)
-                if dataset_route.loader_name == "synthetic":
-                    raise RuntimeError(
-                        "Training engine requires real market data. "
-                        "Select 'btc_binance_parquet', 'eth_binance_parquet', 'btc_binance_api', or 'eth_binance_api'."
-                    )
-                # Use parquet path from route, or for API routes use same path convention (we create it below).
-                if dataset_route.loader_name == "parquet" and dataset_route.path:
-                    parquet_path = _project_root / dataset_route.path
-                else:
-                    parquet_path = _project_root / "datasets" / "binance" / f"{dataset_route.symbol}_1s.parquet"
-                if not parquet_path.exists():
-                    parquet_path.parent.mkdir(parents=True, exist_ok=True)
-                    with st.spinner(f"Creating parquet dataset for {dataset_route.symbol} ({start_dt.date()} to {end_dt.date()})..."):
-                        BinanceIngestor(base_dir=_project_root / "datasets" / "binance").ingest(
-                            symbol=dataset_route.symbol,
-                            start_time=start_dt,
-                            end_time=end_dt,
-                        )
-                tape = MarketTape(str(parquet_path))
-                engine = TrainingEngine(
-                    tape=tape,
-                    dataset_builder=EdgeDatasetBuilder(),
-                    retrain_interval=1000,
-                    metric_interval=100,
-                    horizon_ticks=60,
-                )
-                engine.start()
-                max_iterations = max(int((end_dt - start_dt).total_seconds()), 1)
-                st.session_state["engine_state"] = engine.run(max_iterations=max_iterations)
-                st.session_state["run_error"] = ""
-
-                if include_simulation:
-                    simulator = ReplaySimulator(
-                        dataset=dataset,
-                        heuristic_guards=heuristics,
-                        signal_config=SignalConfig(
-                            stability_ratio_threshold=stability_ratio_threshold,
-                            entropy_threshold=entropy_threshold,
-                            accel_threshold=accel_threshold,
-                            spread_threshold=spread_threshold,
-                            evaluation_window_seconds=60.0,
-                        ),
-                        api_limit=int(api_limit),
-                        persistence_mode=persistence_mode,
-                    )
-                    st.session_state["sim_outputs"] = simulator.run(
-                        start_time=start_dt,
-                        end_time=end_dt,
-                        stream_count=stream_count,
-                        total_capital=total_capital,
-                        transaction_cost=transaction_cost,
-                    )
-                    st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
-                    st.session_state["last_simulation_config"] = {
-                        "dataset": dataset,
-                        "start": start_dt,
-                        "end": end_dt,
-                        "stream_count": stream_count,
-                        "total_capital": total_capital,
-                        "stability_ratio_threshold": stability_ratio_threshold,
-                        "entropy_threshold": entropy_threshold,
-                        "accel_threshold": accel_threshold,
-                        "spread_threshold": spread_threshold,
-                        "evaluation_window_seconds": 60.0,
-                        "transaction_cost": transaction_cost,
-                        **heuristics,
-                    }
-                else:
-                    st.session_state["sim_outputs"] = None
-                    st.session_state["last_simulation_output"] = None
-                    st.session_state["last_simulation_config"] = None
+                st.session_state["live_engine"] = _build_live_engine(dataset)
+                _push_event(f"Simulation started for dataset={dataset}, target_samples={target_samples:,}")
             except Exception as exc:
-                st.session_state["sim_outputs"] = None
-                st.session_state["engine_state"] = None
                 st.session_state["run_error"] = str(exc)
-            finally:
-                if engine is not None:
-                    engine.stop()
+        st.session_state["running"] = st.session_state["run_error"] == ""
 
-    if st.session_state.get("engine_state") is not None and st.session_state.get("last_run_started_at"):
-        completed_at = datetime.now()
-        elapsed = completed_at - st.session_state["last_run_started_at"]
-        st.caption(f"Last training run duration: {elapsed}")
+    if pause_clicked:
+        st.session_state["running"] = False
+        engine = st.session_state.get("live_engine")
+        if engine is not None:
+            engine.pause()
+        _push_event("Simulation paused")
 
-    engine_state = st.session_state.get("engine_state")
-    outputs: SimulationOutputs | None = st.session_state["sim_outputs"]
-    if outputs is None:
-        if st.session_state.get("run_error"):
-            st.error(f"DATASET ERROR: {st.session_state['run_error']}")
-        elif engine_state is None:
-            st.info("Set parameters and click **Run Training Engine**. Optional: enable replay simulation for full analytics.")
-        else:
-            st.success("Training engine completed. Enable replay simulation section for analytics panels.")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Observations Seen", f"{engine_state.observations_seen:,}")
-            c2.metric("Dataset Size", f"{engine_state.dataset_size:,}")
-            c3.metric("Retrains", f"{engine_state.retrains:,}")
-            c4.metric("Runtime State", str(engine_state.runtime_state))
-            if engine_state.latest_metrics:
-                st.json(engine_state.latest_metrics)
-        return
+    if reset_clicked:
+        st.session_state["running"] = False
+        engine = st.session_state.get("live_engine")
+        if engine is not None:
+            engine.stop()
+        st.session_state["live_engine"] = None
+        st.session_state["live_tape"] = None
+        st.session_state["processed_steps"] = 0
+        st.session_state["market_candles"] = []
+        st.session_state["dataset_growth"] = []
+        st.session_state["edge_history"] = []
+        st.session_state["spearman_history"] = []
+        st.session_state["calibration_history"] = []
+        st.session_state["signal_history"] = []
+        st.session_state["signal_outcome_history"] = []
+        st.session_state["feature_importance"] = []
+        st.session_state["event_log"] = []
+        st.session_state["run_error"] = ""
 
-    loaded_source = outputs.dataset_diagnostics.get("api_source", "")
-    selected_dataset = st.session_state.get("last_simulation_config", {}).get("dataset", "")
-    if loaded_source == "synthetic" and selected_dataset != "synthetic":
-        st.warning(
-            f"DATASET WARNING\nDataset selected: {selected_dataset}\nDataset loaded: {loaded_source}"
+    if st.session_state.get("run_error"):
+        st.error(st.session_state["run_error"])
+
+    controls = st.container()
+    market_chart = st.empty()
+    metrics_panel = st.empty()
+    learning_charts = st.empty()
+    feature_panel = st.empty()
+    event_log = st.empty()
+
+    with controls:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Target Samples", f"{target_samples:,}")
+        c2.metric("Processed", f"{st.session_state['processed_steps']:,}")
+        c3.metric("Simulation Speed", simulation_speed)
+        c4.metric("Runtime", "RUNNING" if st.session_state["running"] else "PAUSED")
+
+    engine = st.session_state.get("live_engine")
+    if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target_samples:
+        engine.start()
+
+        steps_per_refresh = 1 if simulation_speed in {"1x", "5x"} else 5
+        for _ in range(steps_per_refresh):
+            if st.session_state["processed_steps"] >= target_samples:
+                st.session_state["running"] = False
+                _push_event("Target sample size reached")
+                break
+
+            snapshot = engine.step()
+            if snapshot is None:
+                st.session_state["running"] = False
+                _push_event("Market tape exhausted")
+                break
+
+            st.session_state["processed_steps"] = snapshot.step_index
+            st.session_state["market_candles"].append(snapshot.candle)
+            st.session_state["market_candles"] = st.session_state["market_candles"][-200:]
+            st.session_state["dataset_growth"].append({"step": snapshot.step_index, "dataset_size": snapshot.dataset_size})
+            st.session_state["edge_history"].append({"step": snapshot.step_index, "edge_score": snapshot.edge_score})
+            st.session_state["spearman_history"].append({"step": snapshot.step_index, "spearman": snapshot.spearman_rank_correlation})
+            st.session_state["calibration_history"].append({"step": snapshot.step_index, "calibration": snapshot.calibration_error})
+            st.session_state["signal_history"].append({"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal})
+            st.session_state["signal_outcome_history"].append(
+                {"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal, "outcome": snapshot.outcome_label}
+            )
+
+            _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
+            _push_event(f"Feature vector generated: {snapshot.feature_vector}")
+            if snapshot.trade_executed:
+                _push_event(f"Trade executed ({snapshot.trade_result})")
+            if snapshot.retrain_event:
+                _push_event(
+                    f"Step {snapshot.step_index}: Retraining model | Edge={snapshot.edge_score:.3f} Spearman={snapshot.spearman_rank_correlation:.3f}"
+                )
+                st.session_state["feature_importance"] = snapshot.feature_importance
+
+    candles_df = pd.DataFrame(st.session_state["market_candles"])
+    if not candles_df.empty:
+        fig = go.Figure(
+            data=[go.Candlestick(
+                x=pd.to_datetime(candles_df["timestamp"]),
+                open=candles_df["open"],
+                high=candles_df["high"],
+                low=candles_df["low"],
+                close=candles_df["close"],
+            )]
         )
+        fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
+        market_chart.plotly_chart(fig, use_container_width=True)
 
-    telemetry = outputs.telemetry
-    trades = outputs.trades
-    traded = _trade_table(telemetry)
+    edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
+    spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
+    calibration_value = st.session_state["calibration_history"][-1]["calibration"] if st.session_state["calibration_history"] else 1.0
+    dataset_size = st.session_state["dataset_growth"][-1]["dataset_size"] if st.session_state["dataset_growth"] else 0
+    trade_count = engine.state.latest_metrics.get("trade_count", 0) if engine is not None else 0
 
-    calibration_df, calibration_error = _calibration_frame(traded)
-    ranking_df, spearman = _ranking_frame(traded)
-    profitability, trade_curve = _profitability_metrics(traded, transaction_cost=transaction_cost)
-    stability_df = _window_stability(trade_curve, windows=[500, 1000, 5000])
-    trade_rate = float(len(trades) / max(len(telemetry), 1))
+    with metrics_panel.container():
+        st.subheader("Live Learning Metrics")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("edge_score", f"{edge_value:.3f}")
+        m2.metric("spearman_rank_correlation", f"{spearman_value:.3f}")
+        m3.metric("calibration_error", f"{calibration_value:.3f}")
+        m4.metric("dataset_size", f"{dataset_size:,}")
+        m5.metric("trade_count", f"{int(trade_count)}")
 
-    edge_components = compute_edge_score(
-        expected_value=profitability["expected_value"],
-        calibration_error=calibration_error,
-        probability_rank_correlation=spearman,
-        max_drawdown=profitability["max_drawdown"],
-        trade_rate=trade_rate,
-    )
-    edge_score = edge_components["edge_score"]
-    recent_stability = float(stability_df["expected_value"].iloc[0]) if not stability_df.empty else 0.0
+    if st.session_state["processed_steps"] % chart_update_every == 0 or not st.session_state["running"]:
+        growth = pd.DataFrame(st.session_state["dataset_growth"])
+        edge_hist = pd.DataFrame(st.session_state["edge_history"])
+        spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
+        calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
+        signal_hist = pd.DataFrame(st.session_state["signal_history"])
+        signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
+        with learning_charts.container():
+            st.subheader("Learning Curves")
+            if not growth.empty:
+                st.line_chart(growth.set_index("step")["dataset_size"], height=180)
+            c1, c2, c3 = st.columns(3)
+            if not edge_hist.empty:
+                c1.line_chart(edge_hist.set_index("step")["edge_score"], height=180)
+            if not spearman_hist.empty:
+                c2.line_chart(spearman_hist.set_index("step")["spearman"], height=180)
+            if not calibration_hist.empty:
+                c3.line_chart(calibration_hist.set_index("step")["calibration"], height=180)
 
-    if edge_score >= 0.8 and profitability["expected_value"] > 0 and calibration_error < 0.05 and recent_stability > 0:
-        edge_status = "Strong Edge Candidate"
-        status_color = "#0f9d58"
-    elif edge_score >= 0.6 and profitability["expected_value"] > 0 and calibration_error < 0.1:
-        edge_status = "Promising Edge"
-        status_color = "#1f77b4"
-    elif edge_score >= 0.3 and profitability["expected_value"] >= 0:
-        edge_status = "Weak Signal"
-        status_color = "#f9a825"
-    else:
-        edge_status = "No Edge Detected"
-        status_color = "#c62828"
+            s1, s2 = st.columns(2)
+            if not signal_hist.empty:
+                s1.plotly_chart(
+                    px.histogram(
+                        signal_hist,
+                        x="predicted_signal",
+                        nbins=30,
+                        title="Predicted Signal Distribution",
+                    ),
+                    use_container_width=True,
+                )
+            if not signal_outcomes.empty:
+                binned = signal_outcomes.copy()
+                binned["signal_bucket"] = pd.cut(
+                    binned["predicted_signal"],
+                    bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.00001],
+                    labels=["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
+                    include_lowest=True,
+                )
+                relation = (
+                    binned.groupby("signal_bucket", observed=False)["outcome"]
+                    .mean()
+                    .reset_index()
+                    .rename(columns={"outcome": "success_rate"})
+                )
+                s2.plotly_chart(
+                    px.bar(relation, x="signal_bucket", y="success_rate", title="Predicted Signal vs Outcome"),
+                    use_container_width=True,
+                )
 
-    model_version = "latest_persistence_model.pkl"
-    latest_model = Path("models/latest_persistence_model.pkl")
-    if latest_model.exists():
-        model_version = latest_model.name
-
-    latest_payload = build_metrics_payload(
-        telemetry=telemetry,
-        traded=traded,
-        edge_score=float(edge_score),
-        edge_status=edge_status,
-        calibration_error=calibration_error,
-        spearman_rank_correlation=spearman,
-        expected_value=profitability["expected_value"],
-        model_version=model_version,
-        dataset_size=len(telemetry),
-    )
-    metrics_artifact = persist_metrics(latest_payload, metrics_path=Path("metrics.json"))
-    artifact_latest = metrics_artifact.get("latest", latest_payload)
-    artifact_history = pd.DataFrame(metrics_artifact.get("history", []))
-
-    st.markdown(
-        f"<div style='padding:0.9rem;border-radius:0.5rem;background:{status_color};color:white;font-weight:700;'>EDGE STATUS: {artifact_latest.get('edge_status', edge_status)}</div>",
-        unsafe_allow_html=True,
-    )
-
-    gauge = pd.DataFrame({"edge_score": [artifact_latest.get("edge_score", edge_score)]})
-    st.plotly_chart(
-        px.bar(
-            gauge,
-            x=["Edge Score"],
-            y="edge_score",
-            range_y=[0, 1],
-            title=f"Edge Score Gauge: {artifact_latest.get('edge_score', edge_score):.2f}",
-        ),
-        use_container_width=True,
-    )
-
-    st.subheader("Metrics Service (metrics.json)")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("training_samples", f"{int(artifact_latest.get('training_samples', len(telemetry))):,}")
-    c2.metric("dataset_size", f"{int(artifact_latest.get('dataset_size', len(telemetry))):,}")
-    c3.metric("model_version", str(artifact_latest.get("model_version", model_version)))
-    c4.metric("trade_selectivity", f"{float(artifact_latest.get('trade_selectivity', trade_rate)) * 100:.2f}%")
-
-    d1, d2, d3 = st.columns(3)
-    d1.metric("drift_distribution", f"{float(artifact_latest.get('drift_distribution', 0.0)):.4f}")
-    d2.metric("drift_prediction_correlation", f"{float(artifact_latest.get('drift_prediction_correlation', 0.0)):.3f}")
-    d3.metric("drift_prediction_rmse", f"{float(artifact_latest.get('drift_prediction_rmse', 0.0)):.4f}")
-
-    if not artifact_history.empty and "timestamp" in artifact_history.columns:
-        artifact_history["timestamp"] = pd.to_datetime(artifact_history["timestamp"], errors="coerce")
-        tracked = [
-            col for col in ["edge_score", "calibration_error", "spearman_rank_correlation", "drift_distribution"] if col in artifact_history.columns
-        ]
-        if tracked:
-            metrics_trend = artifact_history[["timestamp", *tracked]].melt(
-                id_vars="timestamp", var_name="metric", value_name="value"
-            )
-            st.plotly_chart(
-                px.line(metrics_trend, x="timestamp", y="value", color="metric", title="Metrics Service Trend History"),
-                use_container_width=True,
-            )
-
-    saved_metrics = load_metrics(Path("metrics.json"))
-    saved_hist = pd.DataFrame(saved_metrics.get("history", []))
-    if not saved_hist.empty and "drift_signal_histogram" in saved_hist.columns:
-        latest_histogram = saved_hist.iloc[-1].get("drift_signal_histogram", [])
-        hist_frame = pd.DataFrame(latest_histogram)
-        if not hist_frame.empty:
-            hist_frame["bin"] = hist_frame.apply(
-                lambda row: f"{float(row['bin_start']):.2f}-{float(row['bin_end']):.2f}", axis=1
-            )
-            st.plotly_chart(
-                px.bar(hist_frame, x="bin", y="count", title="Drift Signal Histogram (latest cycle)"),
-                use_container_width=True,
-            )
-
-    run_config = st.session_state.get("last_simulation_config", {})
-    run_config.setdefault("transaction_cost", transaction_cost)
-    metrics_text = _edge_validation_metrics_text(
-        edge_status=edge_status,
-        edge_score=edge_score,
-        calibration_error=calibration_error,
-        spearman=spearman,
-        profitability=profitability,
-        stability_df=stability_df,
-        config=run_config,
-    )
-    metrics_b64 = base64.b64encode(metrics_text.encode()).decode()
-    payload_attr = metrics_b64.replace("&", "&amp;").replace('"', "&quot;")
-    copy_html = f"""
-    <div id="edge-metrics-b64" data-payload="{payload_attr}"></div>
-    <button id="copy-edge-metrics" style="
-        padding: 0.4rem 0.8rem;
-        font-size: 0.9rem;
-        cursor: pointer;
-        border-radius: 0.35rem;
-        border: 1px solid #ccc;
-        background: #f0f2f6;
-    ">Copy edge validation metrics</button>
-    <span id="copy-feedback" style="margin-left: 0.5rem; font-size: 0.9rem; color: #0f9d58;"></span>
-    <script>
-    (function() {{
-        var el = document.getElementById('edge-metrics-b64');
-        var b64 = el && el.getAttribute('data-payload') || '';
-        var text = b64 ? atob(b64) : '';
-        var btn = document.getElementById('copy-edge-metrics');
-        var feedback = document.getElementById('copy-feedback');
-        if (btn && text) {{
-            btn.onclick = function() {{
-                navigator.clipboard.writeText(text).then(function() {{
-                    feedback.textContent = 'Copied!';
-                    setTimeout(function() {{ feedback.textContent = ''; }}, 2000);
-                }});
-            }};
-        }}
-    }})();
-    </script>
-    """
-    components.html(copy_html, height=50)
-
-    st.subheader("Model Calibration")
-    st.metric("Calibration Error (mean absolute gap)", f"{calibration_error:.3f}")
-    if calibration_error < 0.05:
-        st.success("Good calibration: error < 0.05")
-    elif calibration_error > 0.10:
-        st.error("Poor calibration: error > 0.10")
-    else:
-        st.info("Calibration is marginal; monitor drift closely.")
-    if not calibration_df.empty:
-        st.plotly_chart(
-            px.line(calibration_df, x="predicted_probability_mean", y="actual_persistence_rate", markers=True, title="Calibration Curve: Expected vs Actual"),
-            use_container_width=True,
-        )
-
-    st.subheader("Probability Ranking Quality")
-    st.metric("Spearman Rank Correlation", f"{spearman:.3f}")
-    if spearman > 0.3:
-        st.success("Strong ranking signal: correlation > 0.3")
-    else:
-        st.warning("Ranking signal is weak: correlation <= 0.3")
-    monotonic = True
-    non_empty_ranking = ranking_df[ranking_df["trade_count"] > 0]
-    if len(non_empty_ranking) > 1:
-        monotonic = bool(non_empty_ranking["win_rate"].fillna(0.0).is_monotonic_increasing)
-    st.caption("Monotonic win-rate progression by bucket is expected.")
-    if monotonic:
-        st.info("Win-rate buckets are monotonic increasing.")
-    else:
-        st.warning("Win-rate buckets are not monotonic; ranking quality may be unstable.")
-    st.dataframe(ranking_df, use_container_width=True, hide_index=True)
-    st.plotly_chart(px.bar(ranking_df, x="probability_bucket", y="win_rate", title="Win Rate by Probability Bucket"), use_container_width=True)
-
-    st.subheader("Profitability Metrics")
-    p1, p2, p3 = st.columns(3)
-    p1.metric("Total Trades", f"{int(profitability['total_trades'])}")
-    p2.metric("Win Rate", f"{profitability['win_rate'] * 100:.2f}%")
-    p3.metric("Average Return / Trade", f"{profitability['avg_return'] * 100:.3f}%")
-    p4, p5, p6 = st.columns(3)
-    p4.metric("Expected Value / Trade", f"{profitability['expected_value'] * 100:.3f}%")
-    p5.metric("Max Drawdown", f"{profitability['max_drawdown'] * 100:.2f}%")
-    p6.metric("Sharpe Ratio", f"{profitability['sharpe']:.2f}")
-    st.plotly_chart(px.line(trade_curve, x="timestamp", y="equity", title="Simulated Strategy Equity Curve"), use_container_width=True)
-    if profitability["expected_value"] > 0:
-        st.success("Positive edge candidate: expected value is above zero.")
-    else:
-        st.error("No positive expectancy detected: expected value is <= 0.")
-
-    st.subheader("Edge Stability")
-    st.dataframe(stability_df, use_container_width=True, hide_index=True)
-    if not stability_df.empty and float(stability_df.iloc[0]["expected_value"]) < 0:
-        st.warning("Recent-window expected value is negative; edge may be decaying.")
-    if not trade_curve.empty:
-        rolling = trade_curve[["timestamp", "net_return"]].copy()
-        rolling["rolling_expected_value_500"] = rolling["net_return"].rolling(window=500, min_periods=50).mean()
-        st.plotly_chart(px.line(rolling, x="timestamp", y="rolling_expected_value_500", title="Rolling Expected Value (500 Trades)"), use_container_width=True)
-
-    st.subheader("Trade Selectivity")
-    training_samples = len(telemetry)
-    exploration_mode = training_samples < MIN_EXPLORATION_SAMPLES
-    threshold = EXPLORATION_THRESHOLD if exploration_mode else EXPLOITATION_THRESHOLD
-    metrics_path = Path("models/model_metrics.json")
-    model_metrics: dict = {}
-    if metrics_path.exists():
-        model_metrics = json.loads(metrics_path.read_text())
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("Total Observations Evaluated", f"{training_samples}")
-    t2.metric("Total Trades Executed", f"{len(trades)}")
-    t3.metric("Trade Frequency", f"{trade_rate * 100:.2f}%")
-    t4.metric("Policy Probability Threshold", f"{threshold:.2f}")
-
-    t5, t6, t7 = st.columns(3)
-    t5.metric("training_samples", f"{training_samples:,}")
-    t6.metric("exploration_mode", "true" if exploration_mode else "false")
-    t7.metric("policy_threshold", f"{threshold:.2f}")
-
-    if autopilot:
-        st.subheader("Autopilot Integration")
-        training_controller = TrainingController.load()
-
-        b1, b2, b3, b4 = st.columns(4)
-        if b1.button("Start Training", use_container_width=True):
-            training_controller.start_training(reset_progress=True)
-            st.rerun()
-        if b2.button("Pause Training", use_container_width=True):
-            training_controller.pause_training()
-            st.rerun()
-        if b3.button("Resume Training", use_container_width=True):
-            training_controller.resume_training()
-            st.rerun()
-        if b4.button("Stop Training", use_container_width=True):
-            training_controller.stop_training()
-            st.rerun()
-
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Training State", training_controller.training_state.value)
-        s2.metric("Controller Training Step", f"{training_controller.training_step:,}")
-        s3.metric("Controller Dataset Size", f"{training_controller.dataset_size:,}")
-
-        default_tape = Path("datasets/binance/BTCUSDT_1s.parquet")
-        if default_tape.exists():
-            tape = MarketTape(default_tape)
-            engine = ResearchEngine(
-                tape=tape,
-                dataset_builder=EdgeDatasetBuilder(),
-                retrain_interval=10000,
-                training_controller=training_controller,
-            )
-            if training_controller.training_state == TrainingLifecycleState.RUNNING:
-                state = engine.run(max_ticks=500)
-                st.success(f"Autopilot processed {state.observations_seen} ticks. Retrains: {state.retrains}")
-            elif training_controller.training_state == TrainingLifecycleState.PAUSED:
-                st.info("Training is paused. Click Resume Training to continue from persisted artifacts.")
-                state = engine.state
-            else:
-                st.info("Training is stopped. Click Start Training to begin a new run.")
-                state = engine.state
-
-            deployed_model = training_controller.model_version
-            train_timestamp = model_metrics.get("timestamp", "n/a") if model_metrics else "n/a"
-            last_retrain = training_controller.last_retrain_time.isoformat() if training_controller.last_retrain_time else "n/a"
-            a1, a2, a3 = st.columns(3)
-            a1.metric("Current Model Version", deployed_model)
-            a2.metric("Training Timestamp", str(train_timestamp))
-            a3.metric("Dataset Size", f"{training_controller.dataset_size:,}")
-            st.caption(f"Last retrain time: {last_retrain}")
+    with feature_panel.container():
+        st.subheader("Top Features (latest retrain)")
+        if st.session_state["feature_importance"]:
+            feature_df = pd.DataFrame(st.session_state["feature_importance"], columns=["feature", "importance"])
+            st.dataframe(feature_df, use_container_width=True, hide_index=True)
         else:
-            st.info("Run data ingestion first to create datasets/binance/BTCUSDT_1s.parquet")
+            st.caption("Feature importance will appear after first retrain event.")
 
-    with st.expander("Research Diagnostics (secondary)"):
-        st.dataframe(telemetry, use_container_width=True, height=280)
+    with event_log.container():
+        st.subheader("Event Log")
+        st.text("\n".join(st.session_state["event_log"][-60:]))
+
+    if st.session_state["running"]:
+        delay = _resolve_speed_delay(simulation_speed)
+        if delay > 0:
+            time.sleep(delay)
+        st.rerun()
 
 
 if __name__ == "__main__":

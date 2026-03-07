@@ -15,8 +15,11 @@ from sklearn.metrics import brier_score_loss, roc_auc_score
 from src.edge.cross_validation import chronological_split
 from src.edge.dataset_builder import EdgeDatasetBuilder, dataset_to_matrices
 from src.edge.diagnostics import generate_edge_surfaces
+from src.edge.edge_score import compute_edge_score
 from src.edge.model import PersistenceModel
 from src.edge.optimizer import random_search_optimize
+from src.edge.policy import TradingPolicy
+from src.features.feature_extractor import FeatureVector
 from src.features import extract_features
 from src.labels import label_persistence, label_short_horizon_move
 from src.tape import MarketTape
@@ -38,6 +41,28 @@ class TrainingEngineState:
     latest_metrics: dict[str, float | int] = field(default_factory=dict)
 
 
+@dataclass
+class StateSnapshot:
+    step_index: int
+    timestamp: str
+    price: float
+    candle: dict[str, float | str]
+    feature_vector: dict[str, float | int]
+    dataset_size: int
+    trade_executed: bool
+    trade_result: str
+    edge_score: float
+    calibration_error: float
+    spearman_rank_correlation: float
+    expected_value: float
+    win_rate: float
+    retrain_event: bool
+    trade_count: int
+    predicted_signal: float
+    outcome_label: int
+    feature_importance: list[tuple[str, float]] = field(default_factory=list)
+
+
 class TrainingEngine:
     def __init__(
         self,
@@ -45,7 +70,7 @@ class TrainingEngine:
         dataset_builder: EdgeDatasetBuilder | None = None,
         *,
         retrain_interval: int = 1000,
-        metric_interval: int = 100,
+        metric_interval: int = 50,
         horizon_ticks: int = 60,
         label_mode: str = "persistence",
         poll_interval_seconds: float = 0.25,
@@ -59,6 +84,11 @@ class TrainingEngine:
         self.poll_interval_seconds = poll_interval_seconds
         self.model = PersistenceModel()
         self.state = TrainingEngineState(dataset_size=len(self.dataset_builder._load()))
+        self.policy = TradingPolicy()
+        self.trade_probabilities: list[float] = []
+        self.trade_outcomes: list[int] = []
+        self.trade_returns: list[float] = []
+        self.last_feature_importance: list[tuple[str, float]] = []
 
     def start(self) -> None:
         self.state.runtime_state = RuntimeState.RUNNING
@@ -93,18 +123,18 @@ class TrainingEngine:
             "retrain_count": self.state.retrains,
         }
 
-    def _maybe_retrain(self) -> None:
+    def _maybe_retrain(self) -> bool:
         data = self.dataset_builder._load()
         if len(data) < 100:
-            return
+            return False
 
         split = chronological_split(data)
         if split.validation.empty or split.test.empty:
-            return
+            return False
 
         X_train, y_train, _ = dataset_to_matrices(split.train)
         if y_train.nunique() < 2:
-            return
+            return False
 
         opt = random_search_optimize(data)
         candidate = PersistenceModel(
@@ -119,7 +149,7 @@ class TrainingEngine:
 
         improved = (new_metrics["roc_auc"] > old_metrics.get("roc_auc", 0.0)) and (new_metrics["brier"] <= old_metrics.get("brier", 1.0))
         if not improved:
-            return
+            return False
 
         ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
         model_path = Path("models") / f"persistence_model_v{ts}.pkl"
@@ -138,6 +168,119 @@ class TrainingEngine:
         }
         Path("models/model_metrics.json").write_text(json.dumps(metrics, indent=2))
         generate_edge_surfaces(data)
+        importance = self.model.feature_importance_
+        if importance is not None:
+            feature_names = list(dataset_to_matrices(split.train)[0].columns)
+            paired = sorted(
+                [(feature_names[idx], float(value)) for idx, value in enumerate(importance)],
+                key=lambda item: abs(item[1]),
+                reverse=True,
+            )
+            self.last_feature_importance = paired[:5]
+        return True
+
+    def _compute_live_metrics(self, trade_executed: bool, trade_outcome: int, signal: float) -> dict[str, float]:
+        if trade_executed:
+            self.trade_probabilities.append(float(signal))
+            self.trade_outcomes.append(int(trade_outcome))
+            self.trade_returns.append(1.0 if trade_outcome == 1 else -1.0)
+
+        trade_count = len(self.trade_outcomes)
+        if trade_count == 0:
+            return {
+                "edge_score": 0.0,
+                "calibration_error": 1.0,
+                "spearman_rank_correlation": 0.0,
+                "expected_value": 0.0,
+                "win_rate": 0.0,
+                "trade_count": 0,
+            }
+
+        probs = pd.Series(self.trade_probabilities, dtype=float)
+        outcomes = pd.Series(self.trade_outcomes, dtype=float)
+        returns = pd.Series(self.trade_returns, dtype=float)
+        calibration_error = float((probs - outcomes).abs().mean())
+        if probs.nunique() < 2 or outcomes.nunique() < 2:
+            spearman = 0.0
+        else:
+            corr = probs.corr(outcomes, method="spearman")
+            spearman = 0.0 if pd.isna(corr) else float(corr)
+        win_rate = float(outcomes.mean())
+        expected_value = float(returns.mean())
+        equity = (1.0 + returns).replace(0, 1e-9).cumprod()
+        drawdown = float((equity / equity.cummax() - 1.0).min())
+        edge = compute_edge_score(
+            expected_value=expected_value,
+            calibration_error=calibration_error,
+            probability_rank_correlation=spearman,
+            max_drawdown=abs(drawdown),
+            trade_rate=float(trade_count / max(self.state.observations_seen, 1)),
+        )
+        return {
+            "edge_score": float(edge["edge_score"]),
+            "calibration_error": calibration_error,
+            "spearman_rank_correlation": spearman,
+            "expected_value": expected_value,
+            "win_rate": win_rate,
+            "trade_count": trade_count,
+        }
+
+    def step(self) -> StateSnapshot | None:
+        if self.state.runtime_state != RuntimeState.RUNNING or not self.tape.has_next():
+            return None
+
+        # Atomic step: exactly one observation is consumed per call.
+        observation = self.tape.next_tick()
+        future_frame = self.tape.peek_future(self.horizon_ticks)
+        future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
+        features: FeatureVector = extract_features(observation)
+        signal = self.model.predict_signal(features.__dict__) if self.state.deployed_model_path else 0.5
+        trade_decision = self.policy.evaluate(probability=float(signal))
+        persistence_label = self._selected_label(observation, future_path)
+
+        self.dataset_builder.append_from_observation(
+            observation,
+            future_path,
+            label_mode=self.label_mode,
+        )
+        self.state.observations_seen += 1
+        self.state.dataset_size += 1
+
+        retrain_event = False
+        if self.state.dataset_size % self.retrain_interval == 0:
+            retrain_event = self._maybe_retrain()
+        if self.state.dataset_size % self.metric_interval == 0:
+            self._recompute_metrics()
+
+        live_metrics = self._compute_live_metrics(trade_decision.enter, persistence_label, signal)
+        self.state.latest_metrics.update(live_metrics)
+        candle = {
+            "timestamp": str(observation.get("timestamp", datetime.now(tz=timezone.utc).isoformat())),
+            "open": float(observation.get("open", observation.get("price", observation.get("close", 0.0)))),
+            "high": float(observation.get("high", observation.get("price", observation.get("close", 0.0)))),
+            "low": float(observation.get("low", observation.get("price", observation.get("close", 0.0)))),
+            "close": float(observation.get("close", observation.get("price", 0.0))),
+        }
+        return StateSnapshot(
+            step_index=self.state.observations_seen,
+            timestamp=candle["timestamp"],
+            price=float(candle["close"]),
+            candle=candle,
+            feature_vector=features.__dict__,
+            dataset_size=self.state.dataset_size,
+            trade_executed=bool(trade_decision.enter),
+            trade_result="WIN" if trade_decision.enter and persistence_label == 1 else ("LOSS" if trade_decision.enter else "NO_TRADE"),
+            edge_score=float(live_metrics["edge_score"]),
+            calibration_error=float(live_metrics["calibration_error"]),
+            spearman_rank_correlation=float(live_metrics["spearman_rank_correlation"]),
+            expected_value=float(live_metrics["expected_value"]),
+            win_rate=float(live_metrics["win_rate"]),
+            retrain_event=retrain_event,
+            trade_count=int(live_metrics["trade_count"]),
+            predicted_signal=float(signal),
+            outcome_label=int(persistence_label),
+            feature_importance=list(self.last_feature_importance),
+        )
 
     def _selected_label(self, observation: dict, future_path: list[float]) -> int:
         if self.label_mode == "short_move":
@@ -160,22 +303,7 @@ class TrainingEngine:
                 iterations += 1
                 continue
 
-            observation = self.tape.next_tick()
-            future_frame = self.tape.peek_future(self.horizon_ticks)
-            future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
-
-            self.dataset_builder.append_from_observation(
-                observation,
-                future_path,
-                label_mode=self.label_mode,
-            )
-            self.state.observations_seen += 1
-            self.state.dataset_size += 1
-
-            if self.state.dataset_size % self.retrain_interval == 0:
-                self._maybe_retrain()
-            if self.state.dataset_size % self.metric_interval == 0:
-                self._recompute_metrics()
+            self.step()
 
             iterations += 1
 
