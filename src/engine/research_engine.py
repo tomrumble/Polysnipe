@@ -19,7 +19,7 @@ from src.edge.model import PersistenceModel
 from src.edge.optimizer import random_search_optimize
 from src.edge.policy import TradingPolicy
 from src.features import extract_features
-from src.labels import label_persistence
+from src.labels import label_drift_10s_pct, label_persistence, label_short_horizon_move
 from src.tape import MarketTape
 
 
@@ -106,14 +106,18 @@ class ResearchEngine:
 
             future_frame = self.tape.peek_future(self.horizon_ticks)
             future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
-            outcome = int(label_persistence(observation, future_path))
+            persistence_label = int(label_persistence(observation, future_path))
+            short_move_label = int(label_short_horizon_move(observation, future_path))
+            drift_10s_pct = float(label_drift_10s_pct(observation, future_path))
 
             self.dataset_builder.append(
                 features,
-                outcome,
+                persistence_label,
+                short_move_label=short_move_label,
+                drift_10s_pct=drift_10s_pct,
                 timestamp=observation.get("timestamp"),
                 symbol=str(observation.get("symbol", "UNKNOWN")),
-                metadata={"probability": probability},
+                metadata={"probability": probability, "label_mode": "persistence", "target": persistence_label},
             )
 
             seen += 1
