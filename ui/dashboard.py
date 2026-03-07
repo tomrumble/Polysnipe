@@ -1,4 +1,4 @@
-"""Research dashboard for simulator + persistence diagnostics.
+"""Edge Validation dashboard for statistically defensible trading edge monitoring.
 
 Run with:
     streamlit run ui/dashboard.py
@@ -7,7 +7,6 @@ Run with:
 from __future__ import annotations
 
 import json
-import html
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,16 +16,18 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
-from src.data import DatasetDiagnostics, fetch_binance_klines_paginated, resolve_dataset_route
+from src.data import fetch_binance_klines_paginated, resolve_dataset_route
 from src.persistence_model import PersistenceInputs, PersistenceModel as DiffusionPersistenceModel
 from src.edge.model import PersistenceModel
 from src.edge.pipeline import run_edge_pipeline
 from src.edge.policy import TradingPolicy
+from src.engine import ResearchEngine
+from src.tape import MarketTape
+from src.edge.dataset_builder import EdgeDatasetBuilder
+from src.edge.edge_score import compute_edge_score
 from src.features import extract_features
-from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
     SignalConfig,
     SignalInputs,
@@ -426,92 +427,108 @@ def _drawdown_series(equity: pd.Series) -> pd.Series:
     return equity / running_peak - 1.0
 
 
-def _strategy_metrics(trades: pd.DataFrame, equity_curve: pd.DataFrame) -> Dict[str, float]:
-    if trades.empty:
-        return {"trade_count": 0, "win_loss_ratio": 0.0, "avg_return": 0.0, "max_drawdown": 0.0}
 
-    wins = (trades["trade_outcome"] == "WIN").sum()
-    losses = (trades["trade_outcome"] == "LOSS").sum()
+CALIBRATION_BINS = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.00001]
+CALIBRATION_LABELS = ["0.50–0.60", "0.60–0.70", "0.70–0.80", "0.80–0.90", "0.90–0.95", "0.95–1.00"]
+RANKING_BINS = [0.6, 0.7, 0.8, 0.9, 0.95, 1.00001]
+RANKING_LABELS = ["0.60–0.70", "0.70–0.80", "0.80–0.90", "0.90–0.95", "0.95–1.00"]
+
+
+def _trade_table(telemetry: pd.DataFrame) -> pd.DataFrame:
+    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
+    traded["outcome"] = (traded["trade_outcome"] == "WIN").astype(int)
+    return traded
+
+
+def _calibration_frame(traded: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    if traded.empty:
+        return pd.DataFrame(columns=["bucket", "predicted_probability_mean", "actual_persistence_rate", "count"]), 1.0
+    frame = traded[["persistence_probability", "outcome"]].copy()
+    frame["bucket"] = pd.cut(frame["persistence_probability"], bins=CALIBRATION_BINS, labels=CALIBRATION_LABELS, include_lowest=True, right=False)
+    summary = frame.groupby("bucket", observed=False).agg(
+        predicted_probability_mean=("persistence_probability", "mean"),
+        actual_persistence_rate=("outcome", "mean"),
+        count=("outcome", "count"),
+    ).reset_index()
+    valid = summary["count"] > 0
+    calibration_error = float((summary.loc[valid, "predicted_probability_mean"] - summary.loc[valid, "actual_persistence_rate"]).abs().mean()) if valid.any() else 1.0
+    return summary, calibration_error
+
+
+def _ranking_frame(traded: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    if traded.empty:
+        return pd.DataFrame(columns=["probability_bucket", "trade_count", "win_rate"]), 0.0
+    frame = traded[["persistence_probability", "outcome"]].copy()
+    frame["probability_bucket"] = pd.cut(frame["persistence_probability"], bins=RANKING_BINS, labels=RANKING_LABELS, include_lowest=True, right=False)
+    summary = frame.groupby("probability_bucket", observed=False).agg(
+        trade_count=("outcome", "count"),
+        win_rate=("outcome", "mean"),
+    ).reset_index()
+    spearman = float(frame["persistence_probability"].corr(frame["outcome"], method="spearman")) if len(frame) > 1 else 0.0
+    return summary, spearman
+
+
+def _profitability_metrics(traded: pd.DataFrame, transaction_cost: float) -> tuple[dict[str, float], pd.DataFrame]:
+    if traded.empty:
+        return {
+            "total_trades": 0,
+            "win_rate": 0.0,
+            "avg_return": 0.0,
+            "expected_value": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+        }, pd.DataFrame(columns=["timestamp", "equity"])
+
+    frame = traded.sort_values("timestamp").copy()
+    frame["net_return"] = frame["return"] - transaction_cost
+    wins = frame[frame["net_return"] > 0]["net_return"]
+    losses = frame[frame["net_return"] <= 0]["net_return"]
+    win_rate = float((frame["net_return"] > 0).mean())
+    loss_rate = 1.0 - win_rate
+    avg_win = float(wins.mean()) if not wins.empty else 0.0
+    avg_loss = float(losses.abs().mean()) if not losses.empty else 0.0
+    expected_value = (win_rate * avg_win) - (loss_rate * avg_loss)
+    frame["equity"] = (1.0 + frame["net_return"]).cumprod()
+    max_drawdown = float(_drawdown_series(frame["equity"]).min())
+    net_std = float(frame["net_return"].std(ddof=0))
+    sharpe = float((frame["net_return"].mean() / max(net_std, 1e-9)) * np.sqrt(len(frame)))
     return {
-        "trade_count": int(len(trades)),
-        "win_loss_ratio": float(wins / max(losses, 1)),
-        "avg_return": float(trades["return"].mean()),
-        "max_drawdown": float(_drawdown_series(equity_curve["equity"]).min()),
-    }
+        "total_trades": float(len(frame)),
+        "win_rate": win_rate,
+        "avg_return": float(frame["net_return"].mean()),
+        "expected_value": float(expected_value),
+        "max_drawdown": max_drawdown,
+        "sharpe": sharpe,
+    }, frame[["timestamp", "equity", "net_return"]]
 
 
-def _bucket_seconds(seconds: float) -> str:
-    if seconds <= 5:
-        return "0-5s"
-    if seconds <= 10:
-        return "5-10s"
-    if seconds <= 20:
-        return "10-20s"
-    if seconds <= 30:
-        return "20-30s"
-    return "30s+"
-
-
-def _success_vs_feature(traded: pd.DataFrame, feature: str, bins: int = 8) -> pd.DataFrame:
-    frame = traded[[feature, "failure"]].dropna().copy()
-    if frame.empty:
-        return pd.DataFrame(columns=["bucket", "success_rate"])
-    frame["bucket"] = pd.cut(frame[feature], bins=bins, include_lowest=True)
-    grouped = frame.groupby("bucket", observed=False).agg(failure_rate=("failure", "mean")).reset_index()
-    grouped["success_rate"] = 1.0 - grouped["failure_rate"]
-    grouped["bucket"] = grouped["bucket"].astype(str)
-    return grouped[["bucket", "success_rate"]]
-
-
-def _copy_metrics_component(payload: str) -> None:
-    """Render a copy-to-clipboard button that runs in the browser with user gesture."""
-    # Embed payload in a data attribute (HTML-escaped). Use base64 to avoid quote/newline issues.
-    import base64
-    payload_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-    components.html(
-        f"""
-        <div id="copy-metrics-container">
-            <button id="copy-metrics-btn" style="
-                padding: 0.4rem 0.8rem;
-                font-size: 0.9rem;
-                cursor: pointer;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                background: #f0f2f6;
-            ">Copy to clipboard</button>
-            <span id="copy-metrics-msg" style="margin-left: 8px; font-size: 0.9rem;"></span>
-        </div>
-        <script>
-            (function() {{
-                var btn = document.getElementById('copy-metrics-btn');
-                var msg = document.getElementById('copy-metrics-msg');
-                var payloadB64 = '{payload_b64}';
-                btn.addEventListener('click', function() {{
-                    try {{
-                        var text = atob(payloadB64);
-                        navigator.clipboard.writeText(text).then(function() {{
-                            msg.textContent = 'Copied!';
-                            msg.style.color = 'green';
-                        }}, function() {{
-                            msg.textContent = 'Clipboard failed (e.g. not HTTPS)';
-                            msg.style.color = 'red';
-                        }});
-                    }} catch (e) {{
-                        msg.textContent = 'Error: ' + e.message;
-                        msg.style.color = 'red';
-                    }}
-                }});
-            }})();
-        </script>
-        """,
-        height=60,
-    )
+def _window_stability(trade_curve: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
+    rows = []
+    for window in windows:
+        segment = trade_curve.tail(window)
+        if segment.empty:
+            rows.append({"window": f"last {window}", "trades": 0, "win_rate": 0.0, "expected_value": 0.0, "drawdown": 0.0})
+            continue
+        w_rate = float((segment["net_return"] > 0).mean())
+        wins = segment[segment["net_return"] > 0]["net_return"]
+        losses = segment[segment["net_return"] <= 0]["net_return"]
+        expected_value = (w_rate * (float(wins.mean()) if not wins.empty else 0.0)) - ((1.0 - w_rate) * (float(losses.abs().mean()) if not losses.empty else 0.0))
+        rows.append(
+            {
+                "window": f"last {window}",
+                "trades": int(len(segment)),
+                "win_rate": w_rate,
+                "expected_value": float(expected_value),
+                "drawdown": float(_drawdown_series((1.0 + segment["net_return"]).cumprod()).min()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
-    st.set_page_config(page_title="Trading Simulator Research Dashboard", layout="wide")
-    st.title("Trading Simulator Research Dashboard")
-    st.caption("Late-stage market collapse detector diagnostics")
+    st.set_page_config(page_title="Edge Validation Panel", layout="wide")
+    st.title("Edge Validation")
+    st.caption("Scientific instrument panel for statistically defensible edge validation")
 
     st.sidebar.header("SIMULATOR CONTROL")
     dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api", "synthetic"])
@@ -536,6 +553,7 @@ def main() -> None:
 
     stream_count = st.sidebar.slider("stream_count", min_value=1, max_value=20, value=4)
     total_capital = st.sidebar.number_input("total_capital", min_value=100.0, value=1000.0, step=100.0)
+    transaction_cost = st.sidebar.number_input("transaction_cost_per_trade", min_value=0.0, max_value=0.01, value=0.0005, step=0.0001, format="%.4f")
     persistence_mode = st.sidebar.selectbox("persistence mode", ["model", "empirical"], index=0)
     api_limit = st.sidebar.number_input("binance api candle limit", min_value=24, max_value=1000, value=600, step=1)
 
@@ -624,6 +642,7 @@ def main() -> None:
                 "accel_threshold": accel_threshold,
                 "spread_threshold": spread_threshold,
                 "evaluation_window_seconds": 60.0,
+                "transaction_cost": transaction_cost,
                 **heuristics,
             }
         except Exception as exc:
@@ -638,13 +657,6 @@ def main() -> None:
             st.info("Set parameters and click **Run Simulation**.")
         return
 
-    if st.session_state.get("last_simulation_output") is not None:
-        report = generate_simulation_report(
-            st.session_state["last_simulation_output"],
-            st.session_state.get("last_simulation_config") or {},
-        )
-        _copy_metrics_component(report)
-
     loaded_source = outputs.dataset_diagnostics.get("api_source", "")
     selected_dataset = st.session_state.get("last_simulation_config", {}).get("dataset", "")
     if loaded_source == "synthetic" and selected_dataset != "synthetic":
@@ -654,79 +666,136 @@ def main() -> None:
 
     telemetry = outputs.telemetry
     trades = outputs.trades
-    traded = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
-    metrics = _strategy_metrics(trades, outputs.equity_curve)
+    traded = _trade_table(telemetry)
 
-    st.header("Strategy Results")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("trade count", f"{metrics['trade_count']}")
-    m2.metric("win/loss ratio", f"{metrics['win_loss_ratio']:.2f}")
-    m3.metric("average return", f"{metrics['avg_return'] * 100:.2f}%")
-    m4.metric("max drawdown", f"{metrics['max_drawdown'] * 100:.2f}%")
+    calibration_df, calibration_error = _calibration_frame(traded)
+    ranking_df, spearman = _ranking_frame(traded)
+    profitability, trade_curve = _profitability_metrics(traded, transaction_cost=transaction_cost)
+    stability_df = _window_stability(trade_curve, windows=[500, 1000, 5000])
+    trade_rate = float(len(trades) / max(len(telemetry), 1))
 
-    st.plotly_chart(px.histogram(telemetry, x="seconds_to_expiry_at_entry", nbins=30, title="Trade entry timing histogram"), use_container_width=True)
+    edge_components = compute_edge_score(
+        expected_value=profitability["expected_value"],
+        calibration_error=calibration_error,
+        probability_rank_correlation=spearman,
+        max_drawdown=profitability["max_drawdown"],
+        trade_rate=trade_rate,
+    )
+    edge_score = edge_components["edge_score"]
+    recent_stability = float(stability_df["expected_value"].iloc[0]) if not stability_df.empty else 0.0
 
-    st.plotly_chart(px.bar(telemetry["signal_reason"].value_counts().reset_index(), x="signal_reason", y="count", title="Signal reason distribution"), use_container_width=True)
+    if edge_score >= 0.8 and profitability["expected_value"] > 0 and calibration_error < 0.05 and recent_stability > 0:
+        edge_status = "Strong Edge Candidate"
+        status_color = "#0f9d58"
+    elif edge_score >= 0.6 and profitability["expected_value"] > 0 and calibration_error < 0.1:
+        edge_status = "Promising Edge"
+        status_color = "#1f77b4"
+    elif edge_score >= 0.3 and profitability["expected_value"] >= 0:
+        edge_status = "Weak Signal"
+        status_color = "#f9a825"
+    else:
+        edge_status = "No Edge Detected"
+        status_color = "#c62828"
 
-    if not traded.empty:
-        regime_matrix = traded.groupby(["regime_label", "trade_outcome"]).size().reset_index(name="count")
-        st.plotly_chart(px.density_heatmap(regime_matrix, x="trade_outcome", y="regime_label", z="count", title="Regime success matrix"), use_container_width=True)
+    st.markdown(
+        f"<div style='padding:0.9rem;border-radius:0.5rem;background:{status_color};color:white;font-weight:700;'>EDGE STATUS: {edge_status}</div>",
+        unsafe_allow_html=True,
+    )
 
-        heat = traded.copy()
-        heat["vol_bucket"] = pd.cut(heat["volatility"], bins=8)
-        heat["ent_bucket"] = pd.cut(heat["directional_entropy"], bins=8)
-        failure_heat = heat.groupby(["vol_bucket", "ent_bucket"], observed=False).agg(failure_rate=("failure", "mean")).reset_index()
-        failure_heat["vol_bucket"] = failure_heat["vol_bucket"].astype(str)
-        failure_heat["ent_bucket"] = failure_heat["ent_bucket"].astype(str)
-        st.plotly_chart(px.density_heatmap(failure_heat, x="ent_bucket", y="vol_bucket", z="failure_rate", title="Failure heatmap (volatility vs entropy)"), use_container_width=True)
+    gauge = pd.DataFrame({"edge_score": [edge_score]})
+    st.plotly_chart(
+        px.bar(gauge, x=["Edge Score"], y="edge_score", range_y=[0, 1], title=f"Edge Score Gauge: {edge_score:.2f}"),
+        use_container_width=True,
+    )
 
-        sec_diag = traded.groupby(traded["seconds_remaining"].apply(_bucket_seconds), observed=False).agg(failure_rate=("failure", "mean")).reset_index(names="seconds_bucket")
-        st.plotly_chart(px.bar(sec_diag, x="seconds_bucket", y="failure_rate", title="Failure rate vs seconds_remaining"), use_container_width=True)
+    st.subheader("Model Calibration")
+    st.metric("Calibration Error (mean absolute gap)", f"{calibration_error:.3f}")
+    if calibration_error < 0.05:
+        st.success("Good calibration: error < 0.05")
+    elif calibration_error > 0.10:
+        st.error("Poor calibration: error > 0.10")
+    else:
+        st.info("Calibration is marginal; monitor drift closely.")
+    if not calibration_df.empty:
+        st.plotly_chart(
+            px.line(calibration_df, x="predicted_probability_mean", y="actual_persistence_rate", markers=True, title="Calibration Curve: Expected vs Actual"),
+            use_container_width=True,
+        )
 
-        for feature in ["directional_entropy", "volatility", "spread"]:
-            chart_df = _success_vs_feature(traded, feature)
-            st.plotly_chart(px.line(chart_df, x="bucket", y="success_rate", title=f"{feature} vs success_rate"), use_container_width=True)
+    st.subheader("Probability Ranking Quality")
+    st.metric("Spearman Rank Correlation", f"{spearman:.3f}")
+    if spearman > 0.3:
+        st.success("Strong ranking signal: correlation > 0.3")
+    else:
+        st.warning("Ranking signal is weak: correlation <= 0.3")
+    monotonic = True
+    non_empty_ranking = ranking_df[ranking_df["trade_count"] > 0]
+    if len(non_empty_ranking) > 1:
+        monotonic = bool(non_empty_ranking["win_rate"].fillna(0.0).is_monotonic_increasing)
+    st.caption("Monotonic win-rate progression by bucket is expected.")
+    if monotonic:
+        st.info("Win-rate buckets are monotonic increasing.")
+    else:
+        st.warning("Win-rate buckets are not monotonic; ranking quality may be unstable.")
+    st.dataframe(ranking_df, use_container_width=True, hide_index=True)
+    st.plotly_chart(px.bar(ranking_df, x="probability_bucket", y="win_rate", title="Win Rate by Probability Bucket"), use_container_width=True)
 
-    st.header("Model Performance")
+    st.subheader("Profitability Metrics")
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Total Trades", f"{int(profitability['total_trades'])}")
+    p2.metric("Win Rate", f"{profitability['win_rate'] * 100:.2f}%")
+    p3.metric("Average Return / Trade", f"{profitability['avg_return'] * 100:.3f}%")
+    p4, p5, p6 = st.columns(3)
+    p4.metric("Expected Value / Trade", f"{profitability['expected_value'] * 100:.3f}%")
+    p5.metric("Max Drawdown", f"{profitability['max_drawdown'] * 100:.2f}%")
+    p6.metric("Sharpe Ratio", f"{profitability['sharpe']:.2f}")
+    st.plotly_chart(px.line(trade_curve, x="timestamp", y="equity", title="Simulated Strategy Equity Curve"), use_container_width=True)
+    if profitability["expected_value"] > 0:
+        st.success("Positive edge candidate: expected value is above zero.")
+    else:
+        st.error("No positive expectancy detected: expected value is <= 0.")
+
+    st.subheader("Edge Stability")
+    st.dataframe(stability_df, use_container_width=True, hide_index=True)
+    if not stability_df.empty and float(stability_df.iloc[0]["expected_value"]) < 0:
+        st.warning("Recent-window expected value is negative; edge may be decaying.")
+    if not trade_curve.empty:
+        rolling = trade_curve[["timestamp", "net_return"]].copy()
+        rolling["rolling_expected_value_500"] = rolling["net_return"].rolling(window=500, min_periods=50).mean()
+        st.plotly_chart(px.line(rolling, x="timestamp", y="rolling_expected_value_500", title="Rolling Expected Value (500 Trades)"), use_container_width=True)
+
+    st.subheader("Trade Selectivity")
+    threshold = TradingPolicy().confidence_threshold
     metrics_path = Path("models/model_metrics.json")
+    model_metrics: dict = {}
     if metrics_path.exists():
         model_metrics = json.loads(metrics_path.read_text())
-        v = model_metrics.get("validation", {})
-        t = model_metrics.get("test", {})
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Validation ROC-AUC", f"{v.get('roc_auc', 0.0):.3f}")
-        c2.metric("Validation Precision/Recall", f"{v.get('precision', 0.0):.3f}/{v.get('recall', 0.0):.3f}")
-        c3.metric("Test Win Rate", f"{t.get('win_rate', 0.0):.3f}")
+        threshold = float(model_metrics.get("best_params", {}).get("probability_threshold", threshold))
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Total Observations Evaluated", f"{len(telemetry)}")
+    t2.metric("Total Trades Executed", f"{len(trades)}")
+    t3.metric("Trade Frequency", f"{trade_rate * 100:.2f}%")
+    t4.metric("Policy Probability Threshold", f"{threshold:.2f}")
 
-        threshold_df = pd.DataFrame(
-            {
-                "threshold": [0.8, 0.85, 0.9, 0.95, 0.97, 0.99],
-                "win_rate": [
-                    float((telemetry[telemetry["persistence_probability"] >= th]["trade_outcome"] == "WIN").mean())
-                    if not telemetry[telemetry["persistence_probability"] >= th].empty
-                    else 0.0
-                    for th in [0.8, 0.85, 0.9, 0.95, 0.97, 0.99]
-                ],
-            }
-        )
-        st.plotly_chart(px.line(threshold_df, x="threshold", y="win_rate", title="Win rate vs probability threshold"), use_container_width=True)
+    if autopilot:
+        st.subheader("Autopilot Integration")
+        default_tape = Path("datasets/binance/BTCUSDT_1s.parquet")
+        if default_tape.exists():
+            tape = MarketTape(default_tape)
+            engine = ResearchEngine(tape=tape, dataset_builder=EdgeDatasetBuilder(), retrain_interval=10000)
+            state = engine.run(max_ticks=500)
+            st.success(f"Autopilot processed {state.observations_seen} ticks. Retrains: {state.retrains}")
+            deployed_model = state.deployed_model_path or "models/latest_persistence_model.pkl"
+            train_timestamp = model_metrics.get("timestamp", "n/a") if model_metrics else "n/a"
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Current Model Version", Path(deployed_model).name)
+            a2.metric("Training Timestamp", str(train_timestamp))
+            a3.metric("Dataset Size", f"{len(telemetry):,}")
+        else:
+            st.info("Run data ingestion first to create datasets/binance/BTCUSDT_1s.parquet")
 
-    latest_model = Path("models/latest_persistence_model.pkl")
-    if latest_model.exists() and not telemetry.empty:
-        edge_model = PersistenceModel.load(latest_model)
-        names = ["entropy", "entropy_slope", "spread", "volatility", "volatility_slope", "stability_ratio", "acceleration", "seconds_remaining", "distance_to_boundary", "regime"]
-        imps = edge_model.feature_importance_
-        if imps is not None:
-            fi = pd.DataFrame({"feature": names, "importance": imps})
-            st.plotly_chart(px.bar(fi.sort_values("importance", ascending=False), x="feature", y="importance", title="Feature Importance"), use_container_width=True)
-
-    diag_path = Path("datasets/diagnostics/entropy_vs_volatility_heatmap.html")
-    if diag_path.exists():
-        st.subheader("Edge Surface")
-        st.components.v1.html(diag_path.read_text(), height=500, scrolling=True)
-
-    st.header("Trade Telemetry")
-    st.dataframe(telemetry, use_container_width=True, height=340)
+    with st.expander("Research Diagnostics (secondary)"):
+        st.dataframe(telemetry, use_container_width=True, height=280)
 
 
 if __name__ == "__main__":
