@@ -31,7 +31,10 @@ def _objective(frame: pd.DataFrame, probabilities: np.ndarray, threshold: float)
     if selected.empty:
         return -1e6
 
-    returns = selected["return"] if "return" in selected.columns else (selected["persistence_outcome"] * 0.01 - (1 - selected["persistence_outcome"]) * 0.01)
+    if "return" not in selected.columns:
+        raise RuntimeError("Optimizer requires a market-derived 'return' column.")
+
+    returns = selected["return"]
     expected_return = float(returns.mean())
     drawdown_penalty = _max_drawdown(returns)
     return expected_return - drawdown_penalty

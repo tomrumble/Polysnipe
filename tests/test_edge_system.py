@@ -2,14 +2,17 @@ from pathlib import Path
 import sys
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.edge.dataset_builder import build_edge_dataset, dataset_to_matrices
 from src.edge.model import PersistenceModel
+from src.edge.optimizer import _objective
 from src.edge.pipeline import run_edge_pipeline
 from src.edge.policy import TradingPolicy
 from src.features import extract_features
+from ui.dashboard import compute_trade_return
 
 
 def sample_telemetry() -> pd.DataFrame:
@@ -55,6 +58,8 @@ def test_dataset_builder(tmp_path: Path):
     ds_path = tmp_path / "edge.parquet"
     data = build_edge_dataset(sample_telemetry(), dataset_path=ds_path, append=False)
     assert ds_path.exists()
+    assert "return" in data.columns
+    assert data["return"].nunique() > 1
     X, y, meta = dataset_to_matrices(data)
     assert not X.empty
     assert len(y) == len(meta)
@@ -90,3 +95,54 @@ def test_pipeline_stability(tmp_path: Path, monkeypatch):
     assert "metrics" in result
     assert Path(result["model_path"]).exists()
     assert Path("models/model_metrics.json").exists()
+
+
+def test_optimizer_requires_market_returns():
+    frame = pd.DataFrame({"persistence_outcome": [1, 0, 1]})
+    probabilities = pd.Series([0.99, 0.99, 0.99]).to_numpy()
+
+    with pytest.raises(RuntimeError, match="requires a market-derived 'return' column"):
+        _objective(frame, probabilities, threshold=0.9)
+
+
+def test_pipeline_rejects_degenerate_return_distribution(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("models").mkdir(parents=True, exist_ok=True)
+    telemetry = sample_telemetry().copy()
+    telemetry["return"] = 0.5
+
+    with pytest.raises(RuntimeError, match="Degenerate return distribution detected"):
+        run_edge_pipeline(telemetry)
+
+
+def test_compute_trade_return_varies_with_market_path():
+    returns = [
+        compute_trade_return(
+            trade_direction="UP",
+            boundary_price=101.0,
+            max_price_until_expiry=101.2,
+            min_price_until_expiry=99.9,
+            payout=0.95,
+            transaction_cost=0.0005,
+        ),
+        compute_trade_return(
+            trade_direction="UP",
+            boundary_price=101.0,
+            max_price_until_expiry=100.8,
+            min_price_until_expiry=99.5,
+            payout=0.95,
+            transaction_cost=0.0005,
+        ),
+        compute_trade_return(
+            trade_direction="DOWN",
+            boundary_price=99.0,
+            max_price_until_expiry=101.0,
+            min_price_until_expiry=98.8,
+            payout=0.95,
+            transaction_cost=0.0005,
+        ),
+    ]
+
+    assert len(set(returns)) > 1
+    assert returns[0] == pytest.approx(0.9495)
+    assert returns[1] == pytest.approx(-1.0005)

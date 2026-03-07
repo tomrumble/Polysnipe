@@ -22,6 +22,13 @@ LABEL_MODE = "persistence"
 
 def run_edge_pipeline(telemetry: pd.DataFrame) -> dict:
     dataset = build_edge_dataset(telemetry, label_mode=LABEL_MODE)
+    if "return" not in dataset.columns:
+        raise RuntimeError("Edge pipeline requires a market-derived 'return' column.")
+
+    return_std = float(dataset["return"].std(ddof=0)) if not dataset.empty else 0.0
+    if np.isnan(return_std) or return_std == 0.0:
+        raise RuntimeError("Degenerate return distribution detected")
+
     split = chronological_split(dataset)
 
     opt = random_search_optimize(dataset)

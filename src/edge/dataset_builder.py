@@ -47,6 +47,7 @@ class EdgeDatasetBuilder:
         timestamp: Any,
         symbol: str,
         metadata: dict[str, Any] | None = None,
+        trade_return: float | None = None,
     ) -> pd.DataFrame:
         payload = {
             **features.__dict__,
@@ -57,6 +58,8 @@ class EdgeDatasetBuilder:
             "symbol": symbol,
             "metadata": json.dumps(metadata or {}, sort_keys=True),
         }
+        if trade_return is not None:
+            payload["return"] = float(trade_return)
         fresh = pd.DataFrame([payload])
         existing = self._load()
         merged = pd.concat([existing, fresh], ignore_index=True)
@@ -82,6 +85,8 @@ class EdgeDatasetBuilder:
             outcome = int(label_short_horizon_move(observation, future_path))
         else:
             outcome = int(label_persistence(observation, future_path))
+        raw_return = observation.get("return")
+        trade_return = float(raw_return) if raw_return is not None and pd.notna(raw_return) else None
         return self.append(
             fv,
             outcome,
@@ -92,6 +97,7 @@ class EdgeDatasetBuilder:
                 "boundary_price": observation.get("boundary_price"),
                 "label_mode": label_mode,
             },
+            trade_return=trade_return,
         )
 
 
