@@ -32,6 +32,7 @@ class SignalInputs:
     seconds_remaining: float
     spread: float
     directional_entropy: float
+    entropy_velocity: float
     price_acceleration: float
     stability_ratio: float
     volatility_current: float
@@ -106,6 +107,7 @@ def evaluate_signal(inputs: SignalInputs, config: SignalConfig) -> SignalDecisio
         CollapseInputs(
             spread=inputs.spread,
             directional_entropy=inputs.directional_entropy,
+            entropy_velocity=inputs.entropy_velocity,
             price_acceleration=inputs.price_acceleration,
             stability_ratio=inputs.stability_ratio,
             volatility_current=inputs.volatility_current,

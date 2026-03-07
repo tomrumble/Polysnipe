@@ -20,7 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
-from src.data import fetch_binance_klines_paginated
+from src.data import DatasetDiagnostics, fetch_binance_klines_paginated, resolve_dataset_route
 from src.persistence_model import PersistenceInputs, PersistenceModel
 from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
@@ -44,9 +44,9 @@ class ReplaySimulator:
     """Lightweight replay simulator for research experimentation."""
 
     DATASET_SEEDS: Dict[str, int] = {
-        "btc_1s_sample": 17,
-        "eth_1s_sample": 43,
-        "macro_high_vol": 99,
+        "btc_binance_api": 17,
+        "eth_binance_api": 43,
+        "synthetic": 99,
     }
     API_DATASET_SYMBOLS: Dict[str, str] = {
         "btc_binance_api": "BTCUSDT",
@@ -99,7 +99,9 @@ class ReplaySimulator:
         if not cached.empty:
             expected = max(int((end_time - start_time).total_seconds()), 1)
             diagnostics = {
-                "api_source": "binance",
+                "api_source": "binance_api",
+                "symbol": symbol,
+                "interval": "1s",
                 "api_limit_per_request": limit,
                 "api_requests_used": 0,
                 "candles_loaded": int(len(cached)),
@@ -124,6 +126,51 @@ class ReplaySimulator:
         frame.to_csv(cls._cache_path(symbol=symbol, limit=limit), index=False)
         return frame, diagnostics_obj.__dict__
 
+    def _load_binance_dataset(
+        self,
+        *,
+        dataset_name: str,
+        start_time: datetime,
+        end_time: datetime,
+        n: int,
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, Dict[str, float | int | str | bool]]:
+        symbol = self.API_DATASET_SYMBOLS[dataset_name]
+        frame, dataset_diagnostics = self._fetch_binance_prices(
+            symbol=symbol,
+            start_time=start_time,
+            end_time=end_time,
+            limit=min(self.api_limit, 1000),
+        )
+        if len(frame) < 24:
+            raise RuntimeError(f"Dataset loader failed: {dataset_name}")
+        timestamps = pd.to_datetime(frame["timestamp"])
+        path = frame["price"].to_numpy(dtype=float)
+        return timestamps, path, dataset_diagnostics
+
+    def _load_synthetic_dataset(
+        self,
+        *,
+        rng: np.random.Generator,
+        base_vol: float,
+        timestamps: pd.DatetimeIndex,
+    ) -> tuple[pd.DatetimeIndex, np.ndarray, Dict[str, float | int | str | bool]]:
+        n = len(timestamps)
+        noise = rng.normal(0, base_vol, n)
+        drift = rng.normal(0.01, 0.05, n).cumsum() / 12
+        path = 100 + np.cumsum(noise + drift)
+        diagnostics = {
+            "api_source": "synthetic",
+            "dataset_loaded": "synthetic",
+            "symbol": "synthetic",
+            "interval": "1s",
+            "api_limit_per_request": 0,
+            "api_requests_used": 0,
+            "candles_loaded": n,
+            "expected_candles_for_range": n,
+            "data_truncation_detected": False,
+        }
+        return timestamps, path, diagnostics
+
     def run(
         self,
         start_time: datetime,
@@ -141,38 +188,40 @@ class ReplaySimulator:
         rng = np.random.default_rng(seed)
 
         base_vol = {
-            "btc_1s_sample": 1.2,
             "btc_binance_api": 1.2,
-            "eth_1s_sample": 1.7,
             "eth_binance_api": 1.7,
-            "macro_high_vol": 2.6,
+            "synthetic": 2.6,
         }.get(self.dataset, 1.3)
 
         timestamps = pd.date_range(start_time, periods=n, freq="s")
 
-        if self.dataset in self.API_DATASET_SYMBOLS:
-            symbol = self.API_DATASET_SYMBOLS[self.dataset]
+        dataset_route = resolve_dataset_route(self.dataset)
+        dataset_loader = dataset_route.loader_name
+
+        if dataset_loader == "binance_api":
             try:
-                frame, dataset_diagnostics = self._fetch_binance_prices(
-                    symbol=symbol,
+                timestamps, path, dataset_diagnostics = self._load_binance_dataset(
+                    dataset_name=dataset_route.dataset_name,
                     start_time=start_time,
                     end_time=end_time,
-                    limit=min(self.api_limit, 1000),
+                    n=n,
                 )
-                if len(frame) >= 24:
-                    timestamps = pd.to_datetime(frame["timestamp"])
-                    path = frame["price"].to_numpy(dtype=float)
-                    n = len(path)
-                else:
-                    raise ValueError("Binance returned insufficient candles for simulation")
-            except Exception:
-                noise = rng.normal(0, base_vol, n)
-                drift = rng.normal(0.01, 0.05, n).cumsum() / 12
-                path = 100 + np.cumsum(noise + drift)
+                n = len(path)
+                dataset_diagnostics["dataset_loaded"] = self.dataset
+            except Exception as exc:
+                raise RuntimeError(f"Dataset loader failed: {self.dataset}") from exc
         else:
-            noise = rng.normal(0, base_vol, n)
-            drift = rng.normal(0.01, 0.05, n).cumsum() / 12
-            path = 100 + np.cumsum(noise + drift)
+            timestamps, path, dataset_diagnostics = self._load_synthetic_dataset(
+                rng=rng,
+                base_vol=base_vol,
+                timestamps=timestamps,
+            )
+            n = len(path)
+
+        dataset_diagnostics.setdefault("dataset_loaded", self.dataset if dataset_loader == "binance_api" else "synthetic")
+
+        if dataset_diagnostics.get("api_source") == "synthetic" and self.dataset != "synthetic":
+            raise RuntimeError("Dataset mismatch detected")
 
         telemetry_rows: List[Dict[str, float | int | str]] = []
         trades_rows: List[Dict[str, float | int | str]] = []
@@ -181,14 +230,6 @@ class ReplaySimulator:
         equity_points: List[float] = []
         last_volatility = 0.0
         entropy_history: List[float] = []
-        dataset_diagnostics: Dict[str, float | int | str | bool] = {
-            "api_source": "synthetic",
-            "api_limit_per_request": 0,
-            "api_requests_used": 0,
-            "candles_loaded": n,
-            "expected_candles_for_range": n,
-            "data_truncation_detected": False,
-        }
 
         for i in range(max(self.entropy_window, 20), n - 1):
             current_price = float(path[i])
@@ -197,7 +238,7 @@ class ReplaySimulator:
             boundary_price = current_price + boundary_side * boundary_delta
             recent_prices = path[i - 20 : i + 1].tolist()
 
-            expiry_idx = min(i + 30, n - 1)
+            expiry_idx = min(i + 60, n - 1)
             seconds_remaining = float((timestamps[expiry_idx] - timestamps[i]).total_seconds())
             now_ts = timestamps[i].timestamp()
             expiry_ts = timestamps[expiry_idx].timestamp()
@@ -217,8 +258,10 @@ class ReplaySimulator:
             entropy_value = float(directional_entropy(path[: i + 1].tolist(), window=self.entropy_window))
             entropy_history.append(entropy_value)
             entropy_slope_before_entry = 0.0
+            entropy_velocity = 0.0
             if len(entropy_history) >= 4:
-                entropy_slope_before_entry = float(entropy_history[-1] - entropy_history[-4])
+                entropy_velocity = float(entropy_history[-1] - entropy_history[-4])
+                entropy_slope_before_entry = entropy_velocity
             regime = classify_regime(
                 volatility=out.volatility,
                 directional_entropy_value=entropy_value,
@@ -232,6 +275,7 @@ class ReplaySimulator:
                     seconds_remaining=seconds_remaining,
                     spread=spread,
                     directional_entropy=entropy_value,
+                    entropy_velocity=entropy_velocity,
                     price_acceleration=accel,
                     stability_ratio=out.stability_ratio,
                     volatility_current=out.volatility,
@@ -298,6 +342,7 @@ class ReplaySimulator:
                 "directional_entropy": entropy_value,
                 "entropy_at_entry": entropy_value,
                 "entropy_slope_before_entry": entropy_slope_before_entry,
+                "entropy_velocity": entropy_velocity,
                 "spread": spread,
                 "spread_at_entry": spread,
                 "price_acceleration": accel,
@@ -432,7 +477,7 @@ def main() -> None:
     st.caption("Late-stage market collapse detector diagnostics")
 
     st.sidebar.header("SIMULATOR CONTROL")
-    dataset = st.sidebar.selectbox("dataset selector", ["btc_1s_sample", "eth_1s_sample", "macro_high_vol", "btc_binance_api", "eth_binance_api"])
+    dataset = st.sidebar.selectbox("dataset selector", ["btc_binance_api", "eth_binance_api", "synthetic"])
 
     now = datetime.now().replace(microsecond=0)
     start_default = now - timedelta(hours=1)
@@ -471,6 +516,8 @@ def main() -> None:
         st.session_state["last_simulation_output"] = None
     if "last_simulation_config" not in st.session_state:
         st.session_state["last_simulation_config"] = None
+    if "run_error" not in st.session_state:
+        st.session_state["run_error"] = ""
 
     if run_clicked:
         start_dt = datetime.combine(start_date, start_clock)
@@ -489,30 +536,38 @@ def main() -> None:
             api_limit=int(api_limit),
             persistence_mode=persistence_mode,
         )
-        st.session_state["sim_outputs"] = simulator.run(
-            start_time=start_dt,
-            end_time=end_dt,
-            stream_count=stream_count,
-            total_capital=total_capital,
-        )
-        st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
-        st.session_state["last_simulation_config"] = {
-            "dataset": dataset,
-            "start": start_dt,
-            "end": end_dt,
-            "stream_count": stream_count,
-            "total_capital": total_capital,
-            "stability_ratio_threshold": stability_ratio_threshold,
-            "entropy_threshold": entropy_threshold,
-            "accel_threshold": accel_threshold,
-            "spread_threshold": spread_threshold,
-            "seconds_remaining_threshold": seconds_threshold,
-            **heuristics,
-        }
+        try:
+            st.session_state["sim_outputs"] = simulator.run(
+                start_time=start_dt,
+                end_time=end_dt,
+                stream_count=stream_count,
+                total_capital=total_capital,
+            )
+            st.session_state["run_error"] = ""
+            st.session_state["last_simulation_output"] = st.session_state["sim_outputs"]
+            st.session_state["last_simulation_config"] = {
+                "dataset": dataset,
+                "start": start_dt,
+                "end": end_dt,
+                "stream_count": stream_count,
+                "total_capital": total_capital,
+                "stability_ratio_threshold": stability_ratio_threshold,
+                "entropy_threshold": entropy_threshold,
+                "accel_threshold": accel_threshold,
+                "spread_threshold": spread_threshold,
+                "seconds_remaining_threshold": seconds_threshold,
+                **heuristics,
+            }
+        except Exception as exc:
+            st.session_state["sim_outputs"] = None
+            st.session_state["run_error"] = str(exc)
 
     outputs: SimulationOutputs | None = st.session_state["sim_outputs"]
     if outputs is None:
-        st.info("Set parameters and click **Run Simulation**.")
+        if st.session_state.get("run_error"):
+            st.error(f"DATASET ERROR: {st.session_state['run_error']}")
+        else:
+            st.info("Set parameters and click **Run Simulation**.")
         return
 
     if st.session_state.get("last_simulation_output") is not None:
@@ -521,6 +576,13 @@ def main() -> None:
             st.session_state.get("last_simulation_config") or {},
         )
         _copy_metrics_component(report)
+
+    loaded_source = outputs.dataset_diagnostics.get("api_source", "")
+    selected_dataset = st.session_state.get("last_simulation_config", {}).get("dataset", "")
+    if loaded_source == "synthetic" and selected_dataset != "synthetic":
+        st.warning(
+            f"DATASET WARNING\nDataset selected: {selected_dataset}\nDataset loaded: {loaded_source}"
+        )
 
     telemetry = outputs.telemetry
     trades = outputs.trades

@@ -31,7 +31,7 @@ COLLAPSE_BLOCKER_ORDER = [
     "regime_not_supported",
 ]
 
-EVAL_BUCKETS = ["0-5", "5-10", "10-20", "20-30", "30+"]
+EVAL_BUCKETS = ["0-5", "5-10", "10-20", "20-30", "30-60", "60+"]
 
 
 def _read_frame(simulation_output: Any, field_name: str) -> pd.DataFrame:
@@ -96,8 +96,10 @@ def _eval_timing_distribution(telemetry: pd.DataFrame) -> Dict[str, int]:
             counts["10-20"] += 1
         elif seconds <= 30:
             counts["20-30"] += 1
+        elif seconds <= 60:
+            counts["30-60"] += 1
         else:
-            counts["30+"] += 1
+            counts["60+"] += 1
     return counts
 
 
@@ -276,6 +278,13 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
             f"observations_evaluated: {observations}",
             f"markets_simulated: {config.get('stream_count', '')}",
             "time_resolution_seconds: 1",
+            "",
+            "DATASET SOURCE",
+            "--------------",
+            f"dataset_selected: {config.get('dataset', '')}",
+            f"dataset_loaded: {dataset_diagnostics.get('dataset_loaded', dataset_diagnostics.get('api_source', ''))}",
+            f"symbol: {dataset_diagnostics.get('symbol', '')}",
+            f"interval: {dataset_diagnostics.get('interval', '')}",
             "",
             "DATASET DIAGNOSTICS",
             "-------------------",
