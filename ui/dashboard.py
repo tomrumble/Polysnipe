@@ -29,7 +29,7 @@ from src.edge.policy import (
     MIN_EXPLORATION_SAMPLES,
     TradingPolicy,
 )
-from src.engine import TrainingEngine
+from src.engine import ResearchEngine, TrainingController, TrainingLifecycleState
 from src.tape import MarketTape
 from src.edge.dataset_builder import EdgeDatasetBuilder
 from src.edge.edge_score import compute_edge_score
@@ -953,15 +953,58 @@ def main() -> None:
     t6.metric("exploration_mode", "true" if exploration_mode else "false")
     t7.metric("policy_threshold", f"{threshold:.2f}")
 
-    if engine_state is not None:
-        st.subheader("Runtime Training Engine")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Observations Seen", f"{engine_state.observations_seen:,}")
-        c2.metric("Dataset Size", f"{engine_state.dataset_size:,}")
-        c3.metric("Retrains", f"{engine_state.retrains:,}")
-        c4.metric("Runtime State", str(engine_state.runtime_state))
-        if engine_state.latest_metrics:
-            st.json(engine_state.latest_metrics)
+    if autopilot:
+        st.subheader("Autopilot Integration")
+        training_controller = TrainingController.load()
+
+        b1, b2, b3, b4 = st.columns(4)
+        if b1.button("Start Training", use_container_width=True):
+            training_controller.start_training(reset_progress=True)
+            st.rerun()
+        if b2.button("Pause Training", use_container_width=True):
+            training_controller.pause_training()
+            st.rerun()
+        if b3.button("Resume Training", use_container_width=True):
+            training_controller.resume_training()
+            st.rerun()
+        if b4.button("Stop Training", use_container_width=True):
+            training_controller.stop_training()
+            st.rerun()
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Training State", training_controller.training_state.value)
+        s2.metric("Controller Training Step", f"{training_controller.training_step:,}")
+        s3.metric("Controller Dataset Size", f"{training_controller.dataset_size:,}")
+
+        default_tape = Path("datasets/binance/BTCUSDT_1s.parquet")
+        if default_tape.exists():
+            tape = MarketTape(default_tape)
+            engine = ResearchEngine(
+                tape=tape,
+                dataset_builder=EdgeDatasetBuilder(),
+                retrain_interval=10000,
+                training_controller=training_controller,
+            )
+            if training_controller.training_state == TrainingLifecycleState.RUNNING:
+                state = engine.run(max_ticks=500)
+                st.success(f"Autopilot processed {state.observations_seen} ticks. Retrains: {state.retrains}")
+            elif training_controller.training_state == TrainingLifecycleState.PAUSED:
+                st.info("Training is paused. Click Resume Training to continue from persisted artifacts.")
+                state = engine.state
+            else:
+                st.info("Training is stopped. Click Start Training to begin a new run.")
+                state = engine.state
+
+            deployed_model = training_controller.model_version
+            train_timestamp = model_metrics.get("timestamp", "n/a") if model_metrics else "n/a"
+            last_retrain = training_controller.last_retrain_time.isoformat() if training_controller.last_retrain_time else "n/a"
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Current Model Version", deployed_model)
+            a2.metric("Training Timestamp", str(train_timestamp))
+            a3.metric("Dataset Size", f"{training_controller.dataset_size:,}")
+            st.caption(f"Last retrain time: {last_retrain}")
+        else:
+            st.info("Run data ingestion first to create datasets/binance/BTCUSDT_1s.parquet")
 
     with st.expander("Research Diagnostics (secondary)"):
         st.dataframe(telemetry, use_container_width=True, height=280)

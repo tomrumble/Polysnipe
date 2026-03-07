@@ -6,8 +6,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data.binance_ingestor import BinanceIngestor
-from src.edge.dataset_builder import EdgeDatasetBuilder
-from src.engine import ResearchEngine, RuntimeState, TrainingEngine
+from src.engine import ResearchEngine, TrainingController
 from src.tape import MarketTape
 
 
@@ -86,7 +85,9 @@ def test_market_tape_and_research_engine_loop(tmp_path: Path):
     market.to_parquet(tape_path, index=False)
 
     tape = MarketTape(tape_path)
-    engine = ResearchEngine(tape=tape, retrain_interval=1000)
+    controller = TrainingController.load(tmp_path / "training_state.json")
+    controller.start_training(reset_progress=False)
+    engine = ResearchEngine(tape=tape, retrain_interval=1000, training_controller=controller)
     state = engine.run(max_ticks=120)
 
     assert state.observations_seen == 120
