@@ -64,6 +64,13 @@ class StateSnapshot:
 
 
 class TrainingEngine:
+    LABEL_ALIASES = [
+        "label_persistence",
+        "persistence_label",
+        "persistence_outcome",
+        "label",
+    ]
+
     def __init__(
         self,
         tape: MarketTape,
@@ -123,14 +130,60 @@ class TrainingEngine:
         frame = frame.dropna(subset=required)
         return frame.sort_values("timestamp").reset_index(drop=True)
 
+    def _normalize_preloaded_labels(self, records: list[dict]) -> list[dict]:
+        normalized_records: list[dict] = []
+        for record in records:
+            normalized = dict(record)
+            label = None
+            for column in self.LABEL_ALIASES:
+                if column in normalized:
+                    label = normalized[column]
+                    break
+
+            if label is None:
+                raise ValueError(
+                    "Preloaded dataset missing persistence label column. "
+                    f"Available columns: {list(normalized.keys())}"
+                )
+
+            try:
+                normalized_label = int(label)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid persistence label value: {label!r}") from exc
+
+            if normalized_label not in (0, 1):
+                raise ValueError(
+                    "Persistence labels must be binary (0 or 1). "
+                    f"Received: {normalized_label}"
+                )
+
+            normalized["label_persistence"] = normalized_label
+            normalized["persistence_label"] = normalized_label
+            normalized["persistence_outcome"] = normalized_label
+            normalized_records.append(normalized)
+
+        return normalized_records
+
     def load_dataset(self, records: list[dict], *, precomputed_features: bool = False) -> None:
         self.records = list(records)
         self.cursor = 0
         self.dataset_preloaded = bool(precomputed_features)
         if precomputed_features:
+            self.records = self._normalize_preloaded_labels(self.records)
             normalized = self._normalize_preloaded_dataset(pd.DataFrame(self.records))
             if normalized.empty:
                 raise ValueError("Preloaded feature dataset contains no usable feature/label rows")
+            labels = [int(label) for label in normalized["label_persistence"].tolist()]
+            if len(set(labels)) < 2:
+                raise ValueError(
+                    "Dataset labels are constant. "
+                    "Model cannot train on a single-class dataset."
+                )
+            print(
+                "[DATASET]",
+                "rows=", len(normalized),
+                "positive_rate=", sum(labels) / len(labels),
+            )
             self.preloaded_dataset = normalized
             self.records = normalized.to_dict("records")
             self.state.dataset_size = len(self.records)
