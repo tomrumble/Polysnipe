@@ -10,7 +10,7 @@ from src.edge.dataset_builder import build_edge_dataset, dataset_to_matrices
 from src.edge.model import PersistenceModel
 from src.edge.optimizer import _objective
 from src.edge.pipeline import run_edge_pipeline
-from src.edge.policy import TradingPolicy
+from src.edge.policy import PolicySide, TradingPolicy
 from src.features import extract_features
 from ui.dashboard import compute_trade_return
 
@@ -77,15 +77,34 @@ def test_model_training_and_probability(tmp_path: Path):
 def test_policy_decision(monkeypatch):
     monkeypatch.setattr("src.edge.policy.random.random", lambda: 1.0)
     policy = TradingPolicy(confidence_threshold=0.97, dataset_size=0, exploration_enabled=True)
-    assert policy.evaluate(0.99).enter is True
-    assert policy.evaluate(0.5).enter is False
+    high = policy.evaluate(0.99)
+    low = policy.evaluate(0.5)
+    assert high.enter is True
+    assert high.side == PolicySide.LONG
+    assert low.enter is False
+    assert low.side == PolicySide.NONE
 
 
 def test_policy_exploitation_threshold(monkeypatch):
     monkeypatch.setattr("src.edge.policy.random.random", lambda: 1.0)
     policy = TradingPolicy(dataset_size=20000, exploration_enabled=True)
-    assert policy.evaluate(0.89).enter is False
-    assert policy.evaluate(0.91).enter is True
+    assert policy.evaluate(0.89).side == PolicySide.NONE
+    assert policy.evaluate(0.91).side == PolicySide.LONG
+
+
+def test_policy_drift_mode_decision():
+    policy = TradingPolicy(mode="drift", drift_threshold=0.001)
+
+    long_decision = policy.evaluate(0.5, predicted_drift=0.002)
+    short_decision = policy.evaluate(0.5, predicted_drift=-0.002)
+    none_decision = policy.evaluate(0.5, predicted_drift=0.0005)
+
+    assert long_decision.enter is True
+    assert long_decision.side == PolicySide.LONG
+    assert short_decision.enter is True
+    assert short_decision.side == PolicySide.SHORT
+    assert none_decision.enter is False
+    assert none_decision.side == PolicySide.NONE
 
 
 def test_pipeline_stability(tmp_path: Path, monkeypatch):

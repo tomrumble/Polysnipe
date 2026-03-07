@@ -38,12 +38,18 @@ class ResearchEngine:
         retrain_interval: int = 10_000,
         horizon_ticks: int = 60,
         confidence_threshold: float = 0.97,
+        policy_mode: str = "persistence",
+        drift_threshold: float = 0.001,
     ) -> None:
         self.tape = tape
         self.dataset_builder = dataset_builder or EdgeDatasetBuilder()
         self.retrain_interval = retrain_interval
         self.horizon_ticks = horizon_ticks
-        self.policy = TradingPolicy(confidence_threshold=confidence_threshold)
+        self.policy = TradingPolicy(
+            confidence_threshold=confidence_threshold,
+            mode=policy_mode,
+            drift_threshold=drift_threshold,
+        )
         self.model: PersistenceModel = PersistenceModel()
         self.state = EngineState()
 
@@ -102,7 +108,7 @@ class ResearchEngine:
             features = extract_features(observation)
             probability = self.model.predict_probability(features.__dict__) if self.state.deployed_model_path else 0.5
             self.policy.dataset_size = self.state.observations_seen
-            _ = self.policy.evaluate(probability)
+            policy_decision = self.policy.evaluate(probability)
 
             future_frame = self.tape.peek_future(self.horizon_ticks)
             future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
@@ -113,7 +119,12 @@ class ResearchEngine:
                 outcome,
                 timestamp=observation.get("timestamp"),
                 symbol=str(observation.get("symbol", "UNKNOWN")),
-                metadata={"probability": probability},
+                metadata={
+                    "probability": probability,
+                    "policy_signal_score": policy_decision.signal_score,
+                    "policy_side": policy_decision.side.value,
+                    "policy_enter": policy_decision.enter,
+                },
             )
 
             seen += 1
