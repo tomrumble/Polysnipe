@@ -86,7 +86,10 @@ def test_generate_simulation_report_with_trades_and_new_diagnostics():
             trades=trades,
             equity_curve=equity_curve,
             dataset_diagnostics={
-                "api_source": "binance",
+                "api_source": "binance_api",
+                "dataset_loaded": "btc_binance_api",
+                "symbol": "BTCUSDT",
+                "interval": "1s",
                 "api_limit_per_request": 1000,
                 "api_requests_used": 2,
                 "candles_loaded": 2200,
@@ -121,7 +124,12 @@ def test_generate_simulation_report_with_trades_and_new_diagnostics():
     assert "EVALUATION TIMING DISTRIBUTION" in report
     assert "0-5: 1" in report
     assert "10-20: 1" in report
-    assert "30+: 1" in report
+    assert "30-60: 1" in report
+    assert "DATASET SOURCE" in report
+    assert "dataset_selected: btc_binance_api" in report
+    assert "dataset_loaded: btc_binance_api" in report
+    assert "symbol: BTCUSDT" in report
+    assert "interval: 1s" in report
     assert "DATASET DIAGNOSTICS" in report
     assert "api_limit_per_request: 1000" in report
 

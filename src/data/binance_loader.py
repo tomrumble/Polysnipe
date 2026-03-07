@@ -15,6 +15,8 @@ import pandas as pd
 @dataclass(frozen=True)
 class DatasetDiagnostics:
     api_source: str
+    symbol: str
+    interval: str
     api_limit_per_request: int
     api_requests_used: int
     candles_loaded: int
@@ -45,6 +47,8 @@ def fetch_binance_klines_paginated(
     cursor_ms = start_ms
     rows: list[dict[str, float | int | datetime]] = []
     request_count = 0
+    seen_open_ms: set[int] = set()
+    last_open_ms: int | None = None
 
     while cursor_ms < end_ms:
         query = urlencode(
@@ -70,6 +74,10 @@ def fetch_binance_klines_paginated(
             close_ms = int(candle[6])
             if open_ms >= end_ms:
                 continue
+            if open_ms in seen_open_ms:
+                continue
+            if last_open_ms is not None and open_ms <= last_open_ms:
+                continue
             rows.append(
                 {
                     "open_time_ms": open_ms,
@@ -78,6 +86,8 @@ def fetch_binance_klines_paginated(
                     "price": float(candle[4]),
                 }
             )
+            seen_open_ms.add(open_ms)
+            last_open_ms = open_ms
 
         next_cursor = int(payload[-1][6]) + 1
         if next_cursor <= cursor_ms:
@@ -89,7 +99,11 @@ def fetch_binance_klines_paginated(
 
     frame = pd.DataFrame(rows, columns=["open_time_ms", "close_time_ms", "timestamp", "price"])
     if not frame.empty:
-        frame = frame.drop_duplicates(subset=["open_time_ms"]).sort_values("open_time_ms").reset_index(drop=True)
+        frame = frame.sort_values("open_time_ms").reset_index(drop=True)
+        if not frame["open_time_ms"].is_monotonic_increasing:
+            raise RuntimeError("Binance pagination returned non-monotonic candle sequence")
+        if not frame["open_time_ms"].is_unique:
+            raise RuntimeError("Binance pagination returned duplicate candles")
 
     expected_seconds_range = max(int((end_time - start_time).total_seconds()), 0)
     expected_candles = max(1, expected_seconds_range)
@@ -97,7 +111,9 @@ def fetch_binance_klines_paginated(
     truncation_detected = candles_loaded < int(0.9 * expected_candles)
 
     diagnostics = DatasetDiagnostics(
-        api_source="binance",
+        api_source="binance_api",
+        symbol=symbol,
+        interval=interval,
         api_limit_per_request=limit,
         api_requests_used=request_count,
         candles_loaded=candles_loaded,
