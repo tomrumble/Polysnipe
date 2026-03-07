@@ -64,6 +64,7 @@ class EdgeDatasetBuilder:
             "persistence_label": int(persistence_label),
             "short_move_label": int(short_move_label),
             "drift_10s_pct": float(drift_10s_pct),
+            # Backward-compat aliases used by older pipeline/tests.
             "persistence_outcome": int(persistence_label),
             "persistence": int(persistence_label),
             "timestamp": pd.to_datetime(timestamp, utc=True),
@@ -72,19 +73,23 @@ class EdgeDatasetBuilder:
         }
         if trade_return is not None:
             payload["return"] = float(trade_return)
+
         fresh = pd.DataFrame([payload])
         existing = self._load()
         merged = pd.concat([existing, fresh], ignore_index=True)
 
-        dedupe_cols = ["timestamp", "symbol", "features"]
-        merged = merged.drop_duplicates(subset=dedupe_cols, keep="last")
+        merged = merged.drop_duplicates(subset=["timestamp", "symbol", "features"], keep="last")
         merged = merged.sort_values("timestamp").reset_index(drop=True)
-
         merged = merged.replace([np.inf, -np.inf], np.nan)
+
         required_cols = FEATURE_COLUMNS + TARGET_COLUMNS + ["timestamp"]
         present_required = [col for col in required_cols if col in merged.columns]
         merged = merged.dropna(subset=present_required)
+
         merged[FEATURE_COLUMNS] = merged[FEATURE_COLUMNS].astype(float)
+        merged["persistence_label"] = merged["persistence_label"].astype(int)
+        merged["short_move_label"] = merged["short_move_label"].astype(int)
+        merged["drift_10s_pct"] = merged["drift_10s_pct"].astype(float)
 
         merged.to_parquet(self.dataset_path, index=False)
         return merged
@@ -97,39 +102,37 @@ class EdgeDatasetBuilder:
         label_mode: str = "persistence",
     ) -> pd.DataFrame:
         fv = extract_features(observation)
-        drift_10s_pct = None
-        if label_mode == "short_move":
-            outcome = int(label_short_horizon_move(observation, future_path))
+        persistence_label = int(label_persistence(observation, future_path))
+        short_move_label = int(label_short_horizon_move(observation, future_path))
+        drift_10s_pct = float(label_future_drift(observation, future_path, horizon=10))
+
+        if label_mode == "persistence":
+            target: float | int = persistence_label
+        elif label_mode == "short_move":
+            target = short_move_label
         elif label_mode == "drift":
-            drift_10s_pct = float(label_future_drift(observation, future_path, horizon=10))
-            outcome = int(drift_10s_pct > 0.0)
+            target = drift_10s_pct
         else:
-            outcome = int(label_persistence(observation, future_path))
+            raise ValueError(f"Unsupported label_mode '{label_mode}'")
+
         raw_return = observation.get("return")
         trade_return = float(raw_return) if raw_return is not None and pd.notna(raw_return) else None
-        payload_metadata = {
-            "entry_price": observation.get("entry_price"),
-            "boundary_price": observation.get("boundary_price"),
-            "label_mode": label_mode,
-        }
-        if drift_10s_pct is not None:
-            payload_metadata["drift_10s_pct"] = drift_10s_pct
 
-        frame = self.append(
+        return self.append(
             fv,
             persistence_label,
             short_move_label=short_move_label,
             drift_10s_pct=drift_10s_pct,
             timestamp=observation.get("timestamp"),
             symbol=str(observation.get("symbol", "UNKNOWN")),
-            metadata=payload_metadata,
+            metadata={
+                "entry_price": observation.get("entry_price"),
+                "boundary_price": observation.get("boundary_price"),
+                "label_mode": label_mode,
+                "target": target,
+            },
             trade_return=trade_return,
         )
-        if drift_10s_pct is not None:
-            mask = (frame["timestamp"] == pd.to_datetime(observation.get("timestamp"), utc=True)) & (frame["symbol"] == str(observation.get("symbol", "UNKNOWN")))
-            frame.loc[mask, "drift_10s_pct"] = drift_10s_pct
-            frame.to_parquet(self.dataset_path, index=False)
-        return frame
 
 
 def build_edge_dataset(
@@ -155,13 +158,6 @@ def dataset_to_matrices(
     label_mode: str = "persistence",
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     X = dataset[FEATURE_COLUMNS].copy()
-    if label_mode in {"drift", "regression", "continuous_drift"}:
-        if "return" not in dataset.columns:
-            raise RuntimeError("Regression label mode requires a market-derived 'return' column.")
-        y = dataset["return"].astype(float)
-    else:
-        y_col = "persistence_outcome" if "persistence_outcome" in dataset.columns else "persistence"
-        y = dataset[y_col].astype(int)
 
     label_map = {
         "persistence": ["persistence_label", "persistence_outcome", "persistence"],
@@ -176,8 +172,7 @@ def dataset_to_matrices(
         raise KeyError(f"No target column available for label_mode '{label_mode}'")
 
     y = pd.to_numeric(dataset[y_col], errors="coerce")
-    if label_mode != "drift":
-        y = y.astype(int)
+    y = y.astype(float if label_mode == "drift" else int)
 
     metadata_cols = [
         c
