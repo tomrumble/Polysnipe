@@ -805,6 +805,17 @@ def _build_live_engine(dataset: str, *, mode: str, target_samples: int) -> Train
             target_samples=target_samples,
             randomized_start=True,
         )
+        if feature_slice.empty:
+            raise RuntimeError(f"Feature dataset '{dataset_name}' has no usable rows after schema validation")
+
+        preview = feature_slice.iloc[0].to_dict()
+        _push_event(
+            "Dataset sanity check | "
+            f"rows={len(feature_slice):,} "
+            f"features={[preview.get('entropy'), preview.get('volatility'), preview.get('stability_ratio')]} "
+            f"label={preview.get('persistence_label', preview.get('label_persistence'))}"
+        )
+
         engine.load_dataset(dataframe_to_records(feature_slice), precomputed_features=True)
         st.session_state["dataset_panel"] = load_dataset_metadata(dataset_name)
     else:
@@ -839,9 +850,6 @@ def main() -> None:
     simulation_speed = st.sidebar.selectbox("simulation_speed", ["1x", "5x", "10x", "50x", "100x"], index=2)
     chart_update_every = int(st.sidebar.number_input("chart_update_every_n_steps", min_value=1, max_value=100, value=25, step=1))
     execution_mode = st.sidebar.selectbox("execution_mode", ["Research", "Live"], index=0)
-    st.session_state["target_samples"] = target_samples
-    st.session_state["simulation_speed"] = simulation_speed
-    st.session_state["chart_update_every_n_steps"] = chart_update_every
 
     b1, b2, b3 = st.sidebar.columns(3)
     start_clicked = b1.button("Start Simulation", type="primary", use_container_width=True)
@@ -885,11 +893,17 @@ def main() -> None:
         st.session_state["event_log"] = []
         st.session_state["run_error"] = ""
 
+    # Fixed slot for error so main() always has same block count (avoids setIn index mismatch when fragment runs).
+    error_ph = st.empty()
     if st.session_state.get("run_error"):
         st.error(st.session_state["run_error"])
 
+    st.session_state["target_samples"] = target_samples
+    st.session_state["simulation_speed"] = simulation_speed
+    st.session_state["chart_update_every_n_steps"] = chart_update_every
+
     # Placeholders live in main() so they are not recreated when the fragment reruns.
-    # Fragment only updates these in place → no DOM replace, no flash.
+    # Fragment only updates these in place -> no DOM replace, no flash.
     controls_ph = st.empty()
     market_chart_ph = st.empty()
     metrics_ph = st.empty()
@@ -905,8 +919,6 @@ def main() -> None:
         "event_log": event_log_ph,
     }
 
-    # Fixed interval so changing speed in sidebar does not recreate the fragment (avoids setIn crash).
-    fragment_interval_sec = 0.15
     panel = st.session_state.get("dataset_panel", {})
     with st.container():
         st.subheader("Dataset Panel")
@@ -917,67 +929,68 @@ def main() -> None:
         d4.metric("samples", f"{int(panel.get('samples', 0)):,}")
         d5.metric("last_updated", str(panel.get("last_updated", "-"))[:19])
 
-    @st.fragment(run_every=fragment_interval_sec)
+    delta_sec = max(0.05, _resolve_speed_delay(st.session_state.get("simulation_speed", "10x")))
+
+    @st.fragment(run_every=delta_sec)
     def live_simulation_panel():
-        ph = st.session_state.get("_ph")
-        if not ph:
+        ph = st.session_state.get("_live_panel_ph")
+        if ph is None:
             return
         target = int(st.session_state["target_samples"])
         speed = st.session_state.get("simulation_speed", "10x")
         chart_every = st.session_state.get("chart_update_every_n_steps", 25)
         delay = _resolve_speed_delay(speed)
 
-        with ph["controls"].container():
+        with ph.container():
+            panel = st.session_state.get("dataset_panel", {})
+            st.subheader("Dataset Panel")
+            d1, d2, d3, d4, d5 = st.columns(5)
+            d1.metric("dataset_name", str(panel.get("dataset_name", dataset)))
+            d2.metric("dataset_source", str(panel.get("dataset_source", resolve_dataset_route(dataset).source)))
+            d3.metric("feature_version", str(panel.get("feature_version", "v1")))
+            d4.metric("samples", f"{int(panel.get('samples', 0)):,}")
+            d5.metric("last_updated", str(panel.get("last_updated", "-"))[:19])
+
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Target Samples", f"{target:,}")
             c2.metric("Processed", f"{st.session_state['processed_steps']:,}")
             c3.metric("Simulation Speed", speed)
             c4.metric("Runtime", "RUNNING" if st.session_state["running"] else "PAUSED")
 
-        engine = st.session_state.get("live_engine")
-        if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target:
-            engine.start()
-            # Steps per fragment tick: faster speed = more steps per tick (delay is lower for faster speeds).
-            steps_per_refresh = max(1, int(0.2 / max(0.01, delay))) if delay > 0 else 20
-            steps_per_refresh = min(steps_per_refresh, 20)
-            for _ in range(steps_per_refresh):
-                if st.session_state["processed_steps"] >= target:
-                    st.session_state["running"] = False
-                    _push_event("Target sample size reached")
-                    break
+            engine = st.session_state.get("live_engine")
+            if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target:
+                engine.start()
+                steps_per_refresh = max(1, int(0.2 / max(0.01, delay))) if delay > 0 else 20
+                steps_per_refresh = min(steps_per_refresh, 20)
+                for _ in range(steps_per_refresh):
+                    if st.session_state["processed_steps"] >= target:
+                        st.session_state["running"] = False
+                        _push_event("Target sample size reached")
+                        break
 
-                snapshot = engine.step()
-                if snapshot is None:
-                    st.session_state["running"] = False
-                    _push_event("Market tape exhausted")
-                    break
+                    snapshot = engine.step()
+                    if snapshot is None:
+                        st.session_state["running"] = False
+                        _push_event("Market tape exhausted")
+                        break
 
-                st.session_state["processed_steps"] = snapshot.step_index
-                st.session_state["market_candles"].append(snapshot.candle)
-                st.session_state["market_candles"] = st.session_state["market_candles"][-200:]
-                st.session_state["dataset_growth"].append({"step": snapshot.step_index, "dataset_size": snapshot.dataset_size})
-                st.session_state["edge_history"].append({"step": snapshot.step_index, "edge_score": snapshot.edge_score})
-                st.session_state["spearman_history"].append({"step": snapshot.step_index, "spearman": snapshot.spearman_rank_correlation})
-                st.session_state["calibration_history"].append({"step": snapshot.step_index, "calibration": snapshot.calibration_error})
-                st.session_state["signal_history"].append({"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal})
-                st.session_state["signal_outcome_history"].append(
-                    {"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal, "outcome": snapshot.outcome_label}
-                )
-
-                _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
-                _push_event(f"Feature vector generated: {snapshot.feature_vector}")
-                if snapshot.trade_executed:
-                    _push_event(f"Trade executed ({snapshot.trade_result})")
-                if snapshot.retrain_event:
-                    _push_event(
-                        f"Step {snapshot.step_index}: Retraining model | Edge={snapshot.edge_score:.3f} Spearman={snapshot.spearman_rank_correlation:.3f}"
+                    st.session_state["processed_steps"] = snapshot.step_index
+                    st.session_state["market_candles"].append(snapshot.candle)
+                    st.session_state["market_candles"] = st.session_state["market_candles"][-200:]
+                    st.session_state["dataset_growth"].append({"step": snapshot.step_index, "dataset_size": snapshot.dataset_size})
+                    st.session_state["edge_history"].append({"step": snapshot.step_index, "edge_score": snapshot.edge_score})
+                    st.session_state["spearman_history"].append({"step": snapshot.step_index, "spearman": snapshot.spearman_rank_correlation})
+                    st.session_state["calibration_history"].append({"step": snapshot.step_index, "calibration": snapshot.calibration_error})
+                    st.session_state["signal_history"].append({"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal})
+                    st.session_state["signal_outcome_history"].append(
+                        {"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal, "outcome": snapshot.outcome_label}
                     )
                     st.session_state["feature_importance"] = snapshot.feature_importance
 
-                panel = st.session_state.get("dataset_panel", {})
-                panel["samples"] = int(max(panel.get("samples", 0), snapshot.dataset_size))
-                panel["last_updated"] = datetime.now().isoformat()
-                st.session_state["dataset_panel"] = panel
+                panel_data = st.session_state.get("dataset_panel", {})
+                panel_data["samples"] = int(max(panel_data.get("samples", 0), snapshot.dataset_size))
+                panel_data["last_updated"] = datetime.now().isoformat()
+                st.session_state["dataset_panel"] = panel_data
 
         candles_df = pd.DataFrame(st.session_state["market_candles"])
         if not candles_df.empty:
@@ -991,18 +1004,46 @@ def main() -> None:
                 )]
             )
             fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
-        else:
-            fig = go.Figure()
-            fig.update_layout(title="Market Replay (Rolling 200 Candles)", height=320)
-        ph["market_chart"].plotly_chart(fig, use_container_width=True)
+            ph["market_chart"].plotly_chart(fig, use_container_width=True)
 
-        edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
-        spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
-        calibration_value = st.session_state["calibration_history"][-1]["calibration"] if st.session_state["calibration_history"] else 1.0
-        dataset_size = st.session_state["dataset_growth"][-1]["dataset_size"] if st.session_state["dataset_growth"] else 0
-        trade_count = engine.state.latest_metrics.get("trade_count", 0) if engine is not None else 0
+                    _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
+                    _push_event(f"Feature vector generated: {snapshot.feature_vector}")
+                    if snapshot.trade_executed:
+                        _push_event(f"Trade executed ({snapshot.trade_result})")
+                    if snapshot.retrain_event:
+                        _push_event(
+                            f"Step {snapshot.step_index}: Retraining model | Edge={snapshot.edge_score:.3f} Spearman={snapshot.spearman_rank_correlation:.3f}"
+                        )
+                        st.session_state["feature_importance"] = snapshot.feature_importance
 
-        with ph["metrics"].container():
+                    panel = st.session_state.get("dataset_panel", {})
+                    panel["samples"] = int(max(panel.get("samples", 0), snapshot.dataset_size))
+                    panel["last_updated"] = datetime.now().isoformat()
+                    st.session_state["dataset_panel"] = panel
+
+            candles_df = pd.DataFrame(st.session_state["market_candles"])
+            if not candles_df.empty:
+                fig = go.Figure(
+                    data=[go.Candlestick(
+                        x=pd.to_datetime(candles_df["timestamp"]),
+                        open=candles_df["open"],
+                        high=candles_df["high"],
+                        low=candles_df["low"],
+                        close=candles_df["close"],
+                    )]
+                )
+                fig.update_layout(title="Market Replay (Rolling 200 Candles)", xaxis_rangeslider_visible=False, height=320)
+            else:
+                fig = go.Figure()
+                fig.update_layout(title="Market Replay (Rolling 200 Candles)", height=320)
+            st.plotly_chart(fig, use_container_width=True)
+
+            edge_value = st.session_state["edge_history"][-1]["edge_score"] if st.session_state["edge_history"] else 0.0
+            spearman_value = st.session_state["spearman_history"][-1]["spearman"] if st.session_state["spearman_history"] else 0.0
+            calibration_value = st.session_state["calibration_history"][-1]["calibration"] if st.session_state["calibration_history"] else 1.0
+            dataset_size = st.session_state["dataset_growth"][-1]["dataset_size"] if st.session_state["dataset_growth"] else 0
+            trade_count = engine.state.latest_metrics.get("trade_count", 0) if engine is not None else 0
+
             st.subheader("Live Learning Metrics")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("edge_score", f"{edge_value:.3f}")
@@ -1011,13 +1052,12 @@ def main() -> None:
             m4.metric("dataset_size", f"{dataset_size:,}")
             m5.metric("trade_count", f"{int(trade_count)}")
 
-        growth = pd.DataFrame(st.session_state["dataset_growth"])
-        edge_hist = pd.DataFrame(st.session_state["edge_history"])
-        spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
-        calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
-        signal_hist = pd.DataFrame(st.session_state["signal_history"])
-        signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
-        with ph["learning_charts"].container():
+            growth = pd.DataFrame(st.session_state["dataset_growth"])
+            edge_hist = pd.DataFrame(st.session_state["edge_history"])
+            spearman_hist = pd.DataFrame(st.session_state["spearman_history"])
+            calibration_hist = pd.DataFrame(st.session_state["calibration_history"])
+            signal_hist = pd.DataFrame(st.session_state["signal_history"])
+            signal_outcomes = pd.DataFrame(st.session_state["signal_outcome_history"])
             st.subheader("Learning Curves")
             growth_plot = growth.rename(columns={"dataset_size": "y"})[["step", "y"]] if not growth.empty and "dataset_size" in growth.columns else pd.DataFrame({"step": [0], "y": [0.0]})
             st.plotly_chart(_line_fig(growth_plot, "step", "y", "Dataset size", 180), use_container_width=True)
@@ -1055,15 +1095,14 @@ def main() -> None:
                     use_container_width=True,
                 )
 
-        with ph["feature_panel"].container():
             st.subheader("Top Features (latest retrain)")
-            if st.session_state["feature_importance"]:
-                feature_df = pd.DataFrame(st.session_state["feature_importance"], columns=["feature", "importance"])
-                st.dataframe(feature_df, use_container_width=True, hide_index=True)
-            else:
-                st.caption("Feature importance will appear after first retrain event.")
+            feature_df = (
+                pd.DataFrame(st.session_state["feature_importance"], columns=["feature", "importance"])
+                if st.session_state["feature_importance"]
+                else pd.DataFrame(columns=["feature", "importance"])
+            )
+            st.dataframe(feature_df, use_container_width=True, hide_index=True)
 
-        with ph["event_log"].container():
             st.subheader("Event Log")
             st.text("\n".join(st.session_state["event_log"][-60:]))
 

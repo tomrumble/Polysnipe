@@ -41,8 +41,8 @@ def test_save_feature_dataset_appends_and_dedupes(tmp_path: Path, monkeypatch):
             "seconds_remaining": [10, 9],
             "distance_to_boundary": [1.0, 1.0],
             "regime_label": [0, 0],
-            "label_persistence": [1, 0],
-            "label_drift": [0.01, -0.01],
+            "persistence_label": [1, 0],
+            "drift_10s_pct": [0.01, -0.01],
         }
     )
     df_two = pd.DataFrame(
@@ -59,8 +59,8 @@ def test_save_feature_dataset_appends_and_dedupes(tmp_path: Path, monkeypatch):
             "seconds_remaining": [8, 7],
             "distance_to_boundary": [1.0, 1.0],
             "regime_label": [0, 0],
-            "label_persistence": [1, 1],
-            "label_drift": [0.02, 0.03],
+            "persistence_label": [1, 1],
+            "drift_10s_pct": [0.02, 0.03],
         }
     )
 

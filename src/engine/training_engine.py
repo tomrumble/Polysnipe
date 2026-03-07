@@ -19,8 +19,8 @@ from src.edge.edge_score import compute_edge_score
 from src.edge.model import PersistenceModel
 from src.edge.optimizer import random_search_optimize
 from src.edge.policy import TradingPolicy
-from src.features.feature_extractor import FeatureVector
 from src.features import extract_features
+from src.features.feature_extractor import FeatureVector
 from src.labels import label_persistence, label_short_horizon_move
 from src.tape import MarketTape
 
@@ -92,13 +92,47 @@ class TrainingEngine:
         self.records: list[dict] = []
         self.cursor: int = 0
         self.dataset_preloaded: bool = False
+        self.preloaded_dataset: pd.DataFrame = pd.DataFrame()
 
+    def _normalize_preloaded_dataset(self, data: pd.DataFrame) -> pd.DataFrame:
+        frame = data.copy()
+        if "timestamp" in frame.columns:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+
+        if "persistence_label" not in frame.columns:
+            for candidate in ["label_persistence", "persistence_outcome", "persistence", "label"]:
+                if candidate in frame.columns:
+                    frame["persistence_label"] = pd.to_numeric(frame[candidate], errors="coerce")
+                    break
+        if "drift_10s_pct" not in frame.columns and "label_drift" in frame.columns:
+            frame["drift_10s_pct"] = pd.to_numeric(frame["label_drift"], errors="coerce")
+
+        if "persistence_label" in frame.columns:
+            frame["label_persistence"] = pd.to_numeric(frame["persistence_label"], errors="coerce")
+            frame["persistence_outcome"] = pd.to_numeric(frame["persistence_label"], errors="coerce")
+            frame["persistence"] = pd.to_numeric(frame["persistence_label"], errors="coerce")
+
+        for col in FEATURE_COLUMNS:
+            if col not in frame.columns:
+                frame[col] = pd.NA
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+        required = ["timestamp", *FEATURE_COLUMNS, "persistence_label"]
+        if "drift_10s_pct" in frame.columns:
+            required.append("drift_10s_pct")
+        frame = frame.dropna(subset=required)
+        return frame.sort_values("timestamp").reset_index(drop=True)
 
     def load_dataset(self, records: list[dict], *, precomputed_features: bool = False) -> None:
         self.records = list(records)
         self.cursor = 0
         self.dataset_preloaded = bool(precomputed_features)
         if precomputed_features:
+            normalized = self._normalize_preloaded_dataset(pd.DataFrame(self.records))
+            if normalized.empty:
+                raise ValueError("Preloaded feature dataset contains no usable feature/label rows")
+            self.preloaded_dataset = normalized
+            self.records = normalized.to_dict("records")
             self.state.dataset_size = len(self.records)
 
     def has_next(self) -> bool:
@@ -116,11 +150,19 @@ class TrainingEngine:
         return self.tape.next_tick()
 
     def _observation_has_precomputed_features(self, observation: dict) -> bool:
-        required = set(FEATURE_COLUMNS + ["label_persistence", "label_drift"])
+        required = set(FEATURE_COLUMNS + ["persistence_label"])
         return required.issubset(set(observation.keys()))
+
+    def _training_dataset(self) -> pd.DataFrame:
+        if self.dataset_preloaded and not self.preloaded_dataset.empty:
+            return self.preloaded_dataset
+        return self.dataset_builder._load()
 
     def start(self) -> None:
         self.state.runtime_state = RuntimeState.RUNNING
+        if self.dataset_preloaded and self.state.deployed_model_path is None:
+            self._maybe_retrain()
+            self._recompute_metrics()
 
     def pause(self) -> None:
         if self.state.runtime_state != RuntimeState.STOPPED:
@@ -154,8 +196,12 @@ class TrainingEngine:
             self.state.latest_metrics = {"dataset_size": 0}
             return
 
-        y_col = "persistence_outcome" if "persistence_outcome" in data.columns else "persistence"
-        positive_rate = float(data[y_col].mean())
+        y_col = next((c for c in ["persistence_label", "persistence_outcome", "persistence"] if c in data.columns), None)
+        if y_col is None:
+            self.state.latest_metrics = {"dataset_size": size, "retrain_count": self.state.retrains}
+            return
+
+        positive_rate = float(pd.to_numeric(data[y_col], errors="coerce").fillna(0).mean())
         self.state.latest_metrics = {
             "dataset_size": size,
             "positive_rate": positive_rate,
@@ -284,7 +330,7 @@ class TrainingEngine:
 
         if precomputed:
             features = FeatureVector(**{col: observation[col] for col in FEATURE_COLUMNS})
-            persistence_label = int(observation.get("label_persistence", 0))
+            persistence_label = int(observation.get("persistence_label", observation.get("label_persistence", 0)))
         else:
             features = extract_features(observation)
             persistence_label = self._selected_label(observation, future_path)
@@ -307,10 +353,7 @@ class TrainingEngine:
         if cadence_count % self.retrain_interval == 0:
             retrain_event = self._maybe_retrain()
         if cadence_count % self.metric_interval == 0:
-            if precomputed:
-                self.state.latest_metrics.update({"dataset_size": self.state.dataset_size, "retrain_count": self.state.retrains})
-            else:
-                self._recompute_metrics()
+            self._recompute_metrics()
 
         live_metrics = self._compute_live_metrics(trade_decision.enter, persistence_label, signal)
         self.state.latest_metrics.update(live_metrics)
@@ -364,7 +407,6 @@ class TrainingEngine:
                 continue
 
             self.step()
-
             iterations += 1
 
         return self.state
