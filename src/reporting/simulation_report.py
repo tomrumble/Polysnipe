@@ -22,6 +22,17 @@ VETO_ORDER = [
     "time_guard",
 ]
 
+COLLAPSE_BLOCKER_ORDER = [
+    "entropy_not_collapsing",
+    "spread_not_tight",
+    "acceleration_too_high",
+    "stability_insufficient",
+    "volatility_not_declining",
+    "regime_not_supported",
+]
+
+EVAL_BUCKETS = ["0-5", "5-10", "10-20", "20-30", "30+"]
+
 
 def _read_frame(simulation_output: Any, field_name: str) -> pd.DataFrame:
     if simulation_output is None:
@@ -35,22 +46,33 @@ def _read_frame(simulation_output: Any, field_name: str) -> pd.DataFrame:
     return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
 
 
-def _safe_mean(frame: pd.DataFrame, column: str) -> str:
+def _read_meta(simulation_output: Any, field_name: str) -> Dict[str, Any]:
+    if simulation_output is None:
+        return {}
+    if isinstance(simulation_output, dict):
+        value = simulation_output.get(field_name, {})
+    else:
+        value = getattr(simulation_output, field_name, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_stat(frame: pd.DataFrame, column: str, agg: str) -> str:
     if column not in frame.columns or frame.empty:
         return ""
-    return f"{float(frame[column].mean()):.4f}"
-
-
-def _safe_min(frame: pd.DataFrame, column: str) -> str:
-    if column not in frame.columns or frame.empty:
+    series = frame[column].dropna()
+    if series.empty:
         return ""
-    return f"{float(frame[column].min()):.4f}"
-
-
-def _safe_max(frame: pd.DataFrame, column: str) -> str:
-    if column not in frame.columns or frame.empty:
-        return ""
-    return f"{float(frame[column].max()):.4f}"
+    if agg == "mean":
+        value = float(series.mean())
+    elif agg == "min":
+        value = float(series.min())
+    elif agg == "max":
+        value = float(series.max())
+    elif agg == "p95":
+        value = float(series.quantile(0.95))
+    else:
+        raise ValueError(f"Unsupported aggregate: {agg}")
+    return f"{value:.4f}"
 
 
 def _format_time(value: Any) -> str:
@@ -61,10 +83,29 @@ def _format_time(value: Any) -> str:
     return str(value)
 
 
+def _eval_timing_distribution(telemetry: pd.DataFrame) -> Dict[str, int]:
+    counts = {bucket: 0 for bucket in EVAL_BUCKETS}
+    if telemetry.empty or "seconds_to_expiry_at_entry" not in telemetry.columns:
+        return counts
+    for seconds in telemetry["seconds_to_expiry_at_entry"].fillna(0.0).astype(float):
+        if seconds <= 5:
+            counts["0-5"] += 1
+        elif seconds <= 10:
+            counts["5-10"] += 1
+        elif seconds <= 20:
+            counts["10-20"] += 1
+        elif seconds <= 30:
+            counts["20-30"] += 1
+        else:
+            counts["30+"] += 1
+    return counts
+
+
 def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -> str:
     """Build a compact, deterministic simulation report suitable for clipboard usage."""
     telemetry = _read_frame(simulation_output, "telemetry")
     trades = _read_frame(simulation_output, "trades")
+    dataset_diagnostics = _read_meta(simulation_output, "dataset_diagnostics")
 
     if trades.empty and not telemetry.empty and "trade_outcome" in telemetry.columns:
         trades = telemetry[telemetry["trade_outcome"].isin(["WIN", "LOSS"])].copy()
@@ -85,6 +126,7 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
         if "seconds_to_expiry_at_entry" in trades.columns
         else pd.Series(dtype="int64")
     )
+    evaluation_timing_distribution = _eval_timing_distribution(telemetry)
 
     signal_distribution = (
         telemetry["signal_reason"].fillna("none").value_counts().sort_index()
@@ -93,8 +135,8 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
     )
 
     regime_distribution = (
-        trades["regime_label"].fillna("").value_counts().to_dict()
-        if "regime_label" in trades.columns
+        telemetry["regime_label"].fillna("").value_counts().to_dict()
+        if "regime_label" in telemetry.columns
         else {}
     )
 
@@ -104,7 +146,18 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
         else {}
     )
 
+    collapse_distribution = (
+        telemetry["collapse_reason"].fillna("").value_counts().to_dict()
+        if "collapse_reason" in telemetry.columns
+        else {}
+    )
+
     filter_blockers = {name: int(veto_distribution.get(name, 0)) for name in VETO_ORDER}
+    collapse_blockers = {name: int(collapse_distribution.get(name, 0)) for name in COLLAPSE_BLOCKER_ORDER}
+
+    observations = len(telemetry)
+    none_signals = int(signal_distribution.get("none", 0)) if not signal_distribution.empty else 0
+    collapse_detector_never_triggered = observations > 0 and observations == none_signals
 
     lines = [
         "POLYSNIPE SIMULATION REPORT",
@@ -149,6 +202,10 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
         for second, count in timing_distribution.items():
             lines.append(f"{second}s: {int(count)}")
 
+    lines.extend(["", "EVALUATION TIMING DISTRIBUTION", "------------------------------", "seconds_remaining_bucket_counts"])
+    for bucket in EVAL_BUCKETS:
+        lines.append(f"{bucket}: {evaluation_timing_distribution[bucket]}")
+
     lines.extend(["", "SIGNAL DISTRIBUTION", "-------------------"])
     if signal_distribution.empty:
         lines.append("none: 0")
@@ -156,49 +213,82 @@ def generate_simulation_report(simulation_output: Any, config: Dict[str, Any]) -
         for reason, count in signal_distribution.items():
             lines.append(f"{reason}: {int(count)}")
 
-    lines.extend(["", "REGIME DISTRIBUTION", "-------------------"])
+    lines.extend(["", "REGIME DISTRIBUTION (ALL OBSERVATIONS)", "--------------------------------------"])
     for regime in REGIME_ORDER:
         lines.append(f"{regime}: {int(regime_distribution.get(regime, 0))}")
 
-    lines.extend(
-        [
-            "",
-            "FEATURE SUMMARY (TRADES ONLY)",
-            "-----------------------------",
-            f"entropy_mean: {_safe_mean(trades, 'entropy_at_entry')}",
-            f"entropy_min: {_safe_min(trades, 'entropy_at_entry')}",
-            f"entropy_max: {_safe_max(trades, 'entropy_at_entry')}",
-            "",
-            f"entropy_slope_before_entry_mean: {_safe_mean(trades, 'entropy_slope_before_entry')}",
-            f"entropy_slope_before_entry_min: {_safe_min(trades, 'entropy_slope_before_entry')}",
-            f"entropy_slope_before_entry_max: {_safe_max(trades, 'entropy_slope_before_entry')}",
-            "",
-            f"spread_mean: {_safe_mean(trades, 'spread_at_entry')}",
-            f"spread_min: {_safe_min(trades, 'spread_at_entry')}",
-            f"spread_max: {_safe_max(trades, 'spread_at_entry')}",
-            "",
-            f"volatility_mean: {_safe_mean(trades, 'volatility_at_entry')}",
-            f"volatility_min: {_safe_min(trades, 'volatility_at_entry')}",
-            f"volatility_max: {_safe_max(trades, 'volatility_at_entry')}",
-            "",
-            f"distance_to_boundary_mean: {_safe_mean(trades, 'distance_to_boundary_at_entry')}",
-            "",
-            "FILTER BLOCKERS",
-            "---------------",
-        ]
-    )
+    lines.extend([
+        "",
+        "FEATURE SUMMARY (TRADES ONLY)",
+        "-----------------------------",
+        f"entropy_mean: {_safe_stat(trades, 'entropy_at_entry', 'mean')}",
+        f"entropy_min: {_safe_stat(trades, 'entropy_at_entry', 'min')}",
+        f"entropy_max: {_safe_stat(trades, 'entropy_at_entry', 'max')}",
+        "",
+        f"entropy_slope_before_entry_mean: {_safe_stat(trades, 'entropy_slope_before_entry', 'mean')}",
+        f"entropy_slope_before_entry_min: {_safe_stat(trades, 'entropy_slope_before_entry', 'min')}",
+        f"entropy_slope_before_entry_max: {_safe_stat(trades, 'entropy_slope_before_entry', 'max')}",
+        "",
+        f"spread_mean: {_safe_stat(trades, 'spread_at_entry', 'mean')}",
+        f"spread_min: {_safe_stat(trades, 'spread_at_entry', 'min')}",
+        f"spread_max: {_safe_stat(trades, 'spread_at_entry', 'max')}",
+        "",
+        f"volatility_mean: {_safe_stat(trades, 'volatility_at_entry', 'mean')}",
+        f"volatility_min: {_safe_stat(trades, 'volatility_at_entry', 'min')}",
+        f"volatility_max: {_safe_stat(trades, 'volatility_at_entry', 'max')}",
+        "",
+        f"distance_to_boundary_mean: {_safe_stat(trades, 'distance_to_boundary_at_entry', 'mean')}",
+        "",
+        "FEATURE DISTRIBUTION (ALL OBSERVATIONS)",
+        "---------------------------------------",
+        f"entropy_mean: {_safe_stat(telemetry, 'directional_entropy', 'mean')}",
+        f"entropy_min: {_safe_stat(telemetry, 'directional_entropy', 'min')}",
+        f"entropy_max: {_safe_stat(telemetry, 'directional_entropy', 'max')}",
+        f"entropy_95pct: {_safe_stat(telemetry, 'directional_entropy', 'p95')}",
+        "",
+        f"stability_ratio_mean: {_safe_stat(telemetry, 'stability_ratio', 'mean')}",
+        f"stability_ratio_min: {_safe_stat(telemetry, 'stability_ratio', 'min')}",
+        f"stability_ratio_max: {_safe_stat(telemetry, 'stability_ratio', 'max')}",
+        f"stability_ratio_95pct: {_safe_stat(telemetry, 'stability_ratio', 'p95')}",
+        "",
+        f"spread_mean: {_safe_stat(telemetry, 'spread', 'mean')}",
+        f"spread_95pct: {_safe_stat(telemetry, 'spread', 'p95')}",
+        "",
+        f"volatility_mean: {_safe_stat(telemetry, 'volatility', 'mean')}",
+        f"volatility_95pct: {_safe_stat(telemetry, 'volatility', 'p95')}",
+        "",
+        "FILTER BLOCKERS",
+        "---------------",
+    ])
 
     for veto in VETO_ORDER:
         lines.append(f"{veto}: {filter_blockers[veto]}")
+
+    lines.extend(["", "COLLAPSE BLOCKERS", "-----------------"])
+    for blocker in COLLAPSE_BLOCKER_ORDER:
+        lines.append(f"{blocker}: {collapse_blockers[blocker]}")
 
     lines.extend(
         [
             "",
             "DATASET SUMMARY",
             "---------------",
-            f"observations_evaluated: {len(telemetry)}",
+            f"observations_evaluated: {observations}",
             f"markets_simulated: {config.get('stream_count', '')}",
-            f"time_resolution_seconds: 1",
+            "time_resolution_seconds: 1",
+            "",
+            "DATASET DIAGNOSTICS",
+            "-------------------",
+            f"api_source: {dataset_diagnostics.get('api_source', '')}",
+            f"api_limit_per_request: {dataset_diagnostics.get('api_limit_per_request', '')}",
+            f"api_requests_used: {dataset_diagnostics.get('api_requests_used', '')}",
+            f"candles_loaded: {dataset_diagnostics.get('candles_loaded', '')}",
+            f"expected_candles_for_range: {dataset_diagnostics.get('expected_candles_for_range', '')}",
+            f"data_truncation_detected: {str(bool(dataset_diagnostics.get('data_truncation_detected', False))).lower()}",
+            "",
+            "SIMULATION WARNINGS",
+            "-------------------",
+            f"collapse_detector_never_triggered: {str(collapse_detector_never_triggered).lower()}",
         ]
     )
 

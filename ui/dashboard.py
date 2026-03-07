@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
-from urllib.parse import urlencode
-from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
@@ -22,6 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
+from src.data import fetch_binance_klines_paginated
 from src.persistence_model import PersistenceInputs, PersistenceModel
 from src.reporting import generate_simulation_report
 from src.signal_pipeline import (
@@ -38,6 +37,7 @@ class SimulationOutputs:
     telemetry: pd.DataFrame
     trades: pd.DataFrame
     equity_curve: pd.DataFrame
+    dataset_diagnostics: Dict[str, float | int | str | bool]
 
 
 class ReplaySimulator:
@@ -88,32 +88,41 @@ class ReplaySimulator:
         return cached[["timestamp", "price"]]
 
     @classmethod
-    def _fetch_binance_prices(cls, symbol: str, limit: int) -> pd.DataFrame:
+    def _fetch_binance_prices(
+        cls,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        limit: int,
+    ) -> tuple[pd.DataFrame, Dict[str, float | int | str | bool]]:
         cached = cls._load_cached_binance_prices(symbol=symbol, limit=limit)
         if not cached.empty:
-            return cached
-
-        query = urlencode({"symbol": symbol, "interval": "1s", "limit": limit})
-        url = f"https://api.binance.com/api/v3/klines?{query}"
-
-        with urlopen(url, timeout=10) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-
-        rows = [
-            {
-                "timestamp": datetime.fromtimestamp(float(row[0]) / 1000),
-                "price": float(row[4]),
+            expected = max(int((end_time - start_time).total_seconds()), 1)
+            diagnostics = {
+                "api_source": "binance",
+                "api_limit_per_request": limit,
+                "api_requests_used": 0,
+                "candles_loaded": int(len(cached)),
+                "expected_candles_for_range": expected,
+                "data_truncation_detected": len(cached) < int(0.9 * expected),
             }
-            for row in payload
-        ]
-        frame = pd.DataFrame(rows, columns=["timestamp", "price"])
+            return cached, diagnostics
+
+        frame, diagnostics_obj = fetch_binance_klines_paginated(
+            symbol=symbol,
+            interval="1s",
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+        frame = frame[["timestamp", "price"]].copy()
 
         if frame.empty:
-            return frame
+            return frame, diagnostics_obj.__dict__
 
         cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         frame.to_csv(cls._cache_path(symbol=symbol, limit=limit), index=False)
-        return frame
+        return frame, diagnostics_obj.__dict__
 
     def run(
         self,
@@ -144,7 +153,12 @@ class ReplaySimulator:
         if self.dataset in self.API_DATASET_SYMBOLS:
             symbol = self.API_DATASET_SYMBOLS[self.dataset]
             try:
-                frame = self._fetch_binance_prices(symbol=symbol, limit=min(self.api_limit, 1000))
+                frame, dataset_diagnostics = self._fetch_binance_prices(
+                    symbol=symbol,
+                    start_time=start_time,
+                    end_time=end_time,
+                    limit=min(self.api_limit, 1000),
+                )
                 if len(frame) >= 24:
                     timestamps = pd.to_datetime(frame["timestamp"])
                     path = frame["price"].to_numpy(dtype=float)
@@ -167,6 +181,14 @@ class ReplaySimulator:
         equity_points: List[float] = []
         last_volatility = 0.0
         entropy_history: List[float] = []
+        dataset_diagnostics: Dict[str, float | int | str | bool] = {
+            "api_source": "synthetic",
+            "api_limit_per_request": 0,
+            "api_requests_used": 0,
+            "candles_loaded": n,
+            "expected_candles_for_range": n,
+            "data_truncation_detected": False,
+        }
 
         for i in range(max(self.entropy_window, 20), n - 1):
             current_price = float(path[i])
@@ -214,6 +236,7 @@ class ReplaySimulator:
                     stability_ratio=out.stability_ratio,
                     volatility_current=out.volatility,
                     volatility_previous=last_volatility if last_volatility > 0 else out.volatility + 1,
+                    regime_label=regime.value,
                 ),
                 self.signal_config,
             )
@@ -282,6 +305,7 @@ class ReplaySimulator:
                 "regime_label": regime.value,
                 "signal_reason": signal_reason,
                 "veto_reason": veto_reason,
+                "collapse_reason": strict_decision.collapse_reason,
                 "heuristic_blocked": heuristic_blocked,
                 "trade_outcome": trade_outcome,
                 "failure": failure,
@@ -307,7 +331,12 @@ class ReplaySimulator:
         telemetry.to_csv(telemetry_path, index=False)
         build_stability_ratio_calibration([telemetry_path], output_path="datasets/calibration/persistence_surface.json")
 
-        return SimulationOutputs(telemetry=telemetry, trades=trades, equity_curve=equity_curve)
+        return SimulationOutputs(
+            telemetry=telemetry,
+            trades=trades,
+            equity_curve=equity_curve,
+            dataset_diagnostics=dataset_diagnostics,
+        )
 
 
 def _drawdown_series(equity: pd.Series) -> pd.Series:
