@@ -329,7 +329,7 @@ class ReplaySimulator:
             features = extract_features(observation)
             model_probability = out.persistence_probability
             if self.edge_model is not None:
-                model_probability = self.edge_model.predict_probability(features)
+                model_probability = self.edge_model.predict_signal(features)
             self.policy.dataset_size = i
             policy_decision = self.policy.evaluate(model_probability)
 

@@ -119,10 +119,18 @@ def build_edge_dataset(
     return builder._load()
 
 
-def dataset_to_matrices(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+def dataset_to_matrices(
+    dataset: pd.DataFrame,
+    label_mode: str = "persistence",
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     X = dataset[FEATURE_COLUMNS].copy()
-    y_col = "persistence_outcome" if "persistence_outcome" in dataset.columns else "persistence"
-    y = dataset[y_col].astype(int)
+    if label_mode in {"drift", "regression", "continuous_drift"}:
+        if "return" not in dataset.columns:
+            raise RuntimeError("Regression label mode requires a market-derived 'return' column.")
+        y = dataset["return"].astype(float)
+    else:
+        y_col = "persistence_outcome" if "persistence_outcome" in dataset.columns else "persistence"
+        y = dataset[y_col].astype(int)
 
     metadata_cols = [c for c in ["timestamp", "symbol", "metadata", "trade_id", "entry_price", "boundary_price", "return"] if c in dataset.columns]
     metadata = dataset[metadata_cols].copy() if metadata_cols else pd.DataFrame(index=dataset.index)
