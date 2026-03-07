@@ -352,24 +352,49 @@ def _success_vs_feature(traded: pd.DataFrame, feature: str, bins: int = 8) -> pd
     return grouped[["bucket", "success_rate"]]
 
 
-def _copy_text_to_clipboard(payload: str) -> bool:
-    try:
-        import pyperclip
-
-        pyperclip.copy(payload)
-        return True
-    except Exception:
-        escaped_payload = html.escape(json.dumps(payload))
-        components.html(
-            f"""
-            <script>
-                const reportText = JSON.parse('{escaped_payload}');
-                navigator.clipboard.writeText(reportText);
-            </script>
-            """,
-            height=0,
-        )
-        return True
+def _copy_metrics_component(payload: str) -> None:
+    """Render a copy-to-clipboard button that runs in the browser with user gesture."""
+    # Embed payload in a data attribute (HTML-escaped). Use base64 to avoid quote/newline issues.
+    import base64
+    payload_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    components.html(
+        f"""
+        <div id="copy-metrics-container">
+            <button id="copy-metrics-btn" style="
+                padding: 0.4rem 0.8rem;
+                font-size: 0.9rem;
+                cursor: pointer;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: #f0f2f6;
+            ">Copy to clipboard</button>
+            <span id="copy-metrics-msg" style="margin-left: 8px; font-size: 0.9rem;"></span>
+        </div>
+        <script>
+            (function() {{
+                var btn = document.getElementById('copy-metrics-btn');
+                var msg = document.getElementById('copy-metrics-msg');
+                var payloadB64 = '{payload_b64}';
+                btn.addEventListener('click', function() {{
+                    try {{
+                        var text = atob(payloadB64);
+                        navigator.clipboard.writeText(text).then(function() {{
+                            msg.textContent = 'Copied!';
+                            msg.style.color = 'green';
+                        }}, function() {{
+                            msg.textContent = 'Clipboard failed (e.g. not HTTPS)';
+                            msg.style.color = 'red';
+                        }});
+                    }} catch (e) {{
+                        msg.textContent = 'Error: ' + e.message;
+                        msg.style.color = 'red';
+                    }}
+                }});
+            }})();
+        </script>
+        """,
+        height=60,
+    )
 
 
 def main() -> None:
@@ -462,13 +487,11 @@ def main() -> None:
         return
 
     if st.session_state.get("last_simulation_output") is not None:
-        if st.button("Copy Metrics to Clipboard"):
-            report = generate_simulation_report(
-                st.session_state["last_simulation_output"],
-                st.session_state.get("last_simulation_config") or {},
-            )
-            _copy_text_to_clipboard(report)
-            st.success("Simulation report copied to clipboard")
+        report = generate_simulation_report(
+            st.session_state["last_simulation_output"],
+            st.session_state.get("last_simulation_config") or {},
+        )
+        _copy_metrics_component(report)
 
     telemetry = outputs.telemetry
     trades = outputs.trades
