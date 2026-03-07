@@ -16,7 +16,7 @@ class DatasetRoute:
 
 
 # Parquet paths under project root (created by Binance ingestor or similar).
-PARQUET_BASE = "datasets/binance"
+PARQUET_BASE = "datasets/raw"
 
 DATASET_LOADERS: dict[str, str] = {
     "btc_binance_api": "binance_api",

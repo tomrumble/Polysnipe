@@ -30,7 +30,17 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.calibration import build_stability_ratio_calibration
-from src.data import BinanceIngestor, fetch_binance_klines_paginated, resolve_dataset_route
+from src.data import (
+    BinanceIngestor,
+    build_feature_dataset,
+    dataframe_to_records,
+    fetch_binance_klines_paginated,
+    load_dataset_metadata,
+    load_feature_dataset,
+    load_parquet_dataset,
+    resolve_dataset_route,
+    save_feature_dataset,
+)
 from src.persistence_model import PersistenceInputs, PersistenceModel as DiffusionPersistenceModel
 from src.edge.model import PersistenceModel
 from src.edge.policy import (
@@ -732,18 +742,24 @@ def _init_live_state() -> None:
         "event_log": [],
         "feature_importance": [],
         "run_error": "",
+        "dataset_panel": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def _build_live_engine(dataset: str) -> TrainingEngine:
+def _feature_dataset_name(dataset_route) -> str:
+    symbol_token = dataset_route.symbol.lower().replace("usdt", "")
+    return f"{symbol_token}_features_v1"
+
+
+def _build_live_engine(dataset: str, *, mode: str, target_samples: int) -> TrainingEngine:
     dataset_route = resolve_dataset_route(dataset)
     if dataset_route.loader_name == "synthetic":
-        raise RuntimeError("Live training requires a parquet-backed dataset (btc_binance_parquet or eth_binance_parquet).")
+        raise RuntimeError("Simulation requires parquet/api-backed datasets.")
 
-    parquet_path = _project_root / (dataset_route.path or f"datasets/binance/{dataset_route.symbol}_1s.parquet")
+    parquet_path = _project_root / (dataset_route.path or f"datasets/raw/{dataset_route.symbol}_1s.parquet")
     if not parquet_path.exists():
         raise RuntimeError(f"Dataset not found: {parquet_path}. Run ingestion first.")
 
@@ -755,6 +771,51 @@ def _build_live_engine(dataset: str) -> TrainingEngine:
         metric_interval=50,
         horizon_ticks=60,
     )
+
+    if mode == "Research":
+        dataset_name = _feature_dataset_name(dataset_route)
+        try:
+            _ = load_feature_dataset(dataset_name)
+        except Exception:
+            raw_frame = load_parquet_dataset(parquet_path)
+            feature_frame = build_feature_dataset(raw_frame)
+            save_feature_dataset(
+                feature_frame,
+                dataset_name,
+                symbol=dataset_route.symbol,
+                interval=dataset_route.interval,
+                feature_version="v1",
+                label_mode="drift",
+                append=True,
+            )
+
+        feature_slice = load_parquet_dataset(
+            _project_root / f"datasets/features/{dataset_name}.parquet",
+            target_samples=target_samples,
+            randomized_start=True,
+        )
+        if feature_slice.empty:
+            raise RuntimeError(f"Feature dataset '{dataset_name}' has no usable rows after schema validation")
+
+        preview = feature_slice.iloc[0].to_dict()
+        _push_event(
+            "Dataset sanity check | "
+            f"rows={len(feature_slice):,} "
+            f"features={[preview.get('entropy'), preview.get('volatility'), preview.get('stability_ratio')]} "
+            f"label={preview.get('persistence_label', preview.get('label_persistence'))}"
+        )
+
+        engine.load_dataset(dataframe_to_records(feature_slice), precomputed_features=True)
+        st.session_state["dataset_panel"] = load_dataset_metadata(dataset_name)
+    else:
+        st.session_state["dataset_panel"] = {
+            "dataset_name": dataset_route.dataset_name,
+            "dataset_source": dataset_route.source,
+            "feature_version": "live",
+            "samples": 0,
+            "last_updated": datetime.now().isoformat(),
+        }
+
     engine.start()
     st.session_state["live_tape"] = tape
     return engine
@@ -777,6 +838,7 @@ def main() -> None:
     target_samples = int(st.sidebar.number_input("target_samples", min_value=100, value=int(st.session_state["target_samples"]), step=1000))
     simulation_speed = st.sidebar.selectbox("simulation_speed", ["1x", "5x", "10x", "50x", "100x"], index=2)
     chart_update_every = int(st.sidebar.number_input("chart_update_every_n_steps", min_value=1, max_value=100, value=25, step=1))
+    execution_mode = st.sidebar.selectbox("execution_mode", ["Research", "Live"], index=0)
 
     b1, b2, b3 = st.sidebar.columns(3)
     start_clicked = b1.button("Start Simulation", type="primary", use_container_width=True)
@@ -788,7 +850,7 @@ def main() -> None:
         st.session_state["run_error"] = ""
         if st.session_state["live_engine"] is None:
             try:
-                st.session_state["live_engine"] = _build_live_engine(dataset)
+                st.session_state["live_engine"] = _build_live_engine(dataset, mode=execution_mode, target_samples=target_samples)
                 _push_event(f"Simulation started for dataset={dataset}, target_samples={target_samples:,}")
             except Exception as exc:
                 st.session_state["run_error"] = str(exc)
@@ -837,6 +899,16 @@ def main() -> None:
         c3.metric("Simulation Speed", simulation_speed)
         c4.metric("Runtime", "RUNNING" if st.session_state["running"] else "PAUSED")
 
+    panel = st.session_state.get("dataset_panel", {})
+    with st.container():
+        st.subheader("Dataset Panel")
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("dataset_name", str(panel.get("dataset_name", dataset)))
+        d2.metric("dataset_source", str(panel.get("dataset_source", resolve_dataset_route(dataset).source)))
+        d3.metric("feature_version", str(panel.get("feature_version", "v1")))
+        d4.metric("samples", f"{int(panel.get('samples', 0)):,}")
+        d5.metric("last_updated", str(panel.get("last_updated", "-"))[:19])
+
     engine = st.session_state.get("live_engine")
     if st.session_state["running"] and engine is not None and st.session_state["processed_steps"] < target_samples:
         engine.start()
@@ -865,6 +937,10 @@ def main() -> None:
             st.session_state["signal_outcome_history"].append(
                 {"step": snapshot.step_index, "predicted_signal": snapshot.predicted_signal, "outcome": snapshot.outcome_label}
             )
+            panel = st.session_state.get("dataset_panel", {})
+            panel["samples"] = int(max(panel.get("samples", 0), snapshot.dataset_size))
+            panel["last_updated"] = datetime.now().isoformat()
+            st.session_state["dataset_panel"] = panel
 
             _push_event(f"Processing candle {snapshot.step_index} @ {snapshot.price:.4f}")
             _push_event(f"Feature vector generated: {snapshot.feature_vector}")

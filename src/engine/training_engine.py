@@ -13,14 +13,14 @@ import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
 from src.edge.cross_validation import chronological_split
-from src.edge.dataset_builder import EdgeDatasetBuilder, dataset_to_matrices
+from src.edge.dataset_builder import FEATURE_COLUMNS, EdgeDatasetBuilder, dataset_to_matrices
 from src.edge.diagnostics import generate_edge_surfaces
 from src.edge.edge_score import compute_edge_score
 from src.edge.model import PersistenceModel
 from src.edge.optimizer import random_search_optimize
 from src.edge.policy import TradingPolicy
-from src.features.feature_extractor import FeatureVector
 from src.features import extract_features
+from src.features.feature_extractor import FeatureVector
 from src.labels import label_persistence, label_short_horizon_move
 from src.tape import MarketTape
 
@@ -89,9 +89,80 @@ class TrainingEngine:
         self.trade_outcomes: list[int] = []
         self.trade_returns: list[float] = []
         self.last_feature_importance: list[tuple[str, float]] = []
+        self.records: list[dict] = []
+        self.cursor: int = 0
+        self.dataset_preloaded: bool = False
+        self.preloaded_dataset: pd.DataFrame = pd.DataFrame()
+
+    def _normalize_preloaded_dataset(self, data: pd.DataFrame) -> pd.DataFrame:
+        frame = data.copy()
+        if "timestamp" in frame.columns:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+
+        if "persistence_label" not in frame.columns:
+            for candidate in ["label_persistence", "persistence_outcome", "persistence", "label"]:
+                if candidate in frame.columns:
+                    frame["persistence_label"] = pd.to_numeric(frame[candidate], errors="coerce")
+                    break
+        if "drift_10s_pct" not in frame.columns and "label_drift" in frame.columns:
+            frame["drift_10s_pct"] = pd.to_numeric(frame["label_drift"], errors="coerce")
+
+        if "persistence_label" in frame.columns:
+            frame["label_persistence"] = pd.to_numeric(frame["persistence_label"], errors="coerce")
+            frame["persistence_outcome"] = pd.to_numeric(frame["persistence_label"], errors="coerce")
+            frame["persistence"] = pd.to_numeric(frame["persistence_label"], errors="coerce")
+
+        for col in FEATURE_COLUMNS:
+            if col not in frame.columns:
+                frame[col] = pd.NA
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+        required = ["timestamp", *FEATURE_COLUMNS, "persistence_label"]
+        if "drift_10s_pct" in frame.columns:
+            required.append("drift_10s_pct")
+        frame = frame.dropna(subset=required)
+        return frame.sort_values("timestamp").reset_index(drop=True)
+
+    def load_dataset(self, records: list[dict], *, precomputed_features: bool = False) -> None:
+        self.records = list(records)
+        self.cursor = 0
+        self.dataset_preloaded = bool(precomputed_features)
+        if precomputed_features:
+            normalized = self._normalize_preloaded_dataset(pd.DataFrame(self.records))
+            if normalized.empty:
+                raise ValueError("Preloaded feature dataset contains no usable feature/label rows")
+            self.preloaded_dataset = normalized
+            self.records = normalized.to_dict("records")
+            self.state.dataset_size = len(self.records)
+
+    def has_next(self) -> bool:
+        if self.records:
+            return self.cursor < len(self.records)
+        return self.tape.has_next()
+
+    def next_tick(self) -> dict:
+        if self.records:
+            if self.cursor >= len(self.records):
+                raise StopIteration("Preloaded dataset exhausted")
+            observation = self.records[self.cursor]
+            self.cursor += 1
+            return observation
+        return self.tape.next_tick()
+
+    def _observation_has_precomputed_features(self, observation: dict) -> bool:
+        required = set(FEATURE_COLUMNS + ["persistence_label"])
+        return required.issubset(set(observation.keys()))
+
+    def _training_dataset(self) -> pd.DataFrame:
+        if self.dataset_preloaded and not self.preloaded_dataset.empty:
+            return self.preloaded_dataset
+        return self.dataset_builder._load()
 
     def start(self) -> None:
         self.state.runtime_state = RuntimeState.RUNNING
+        if self.dataset_preloaded and self.state.deployed_model_path is None:
+            self._maybe_retrain()
+            self._recompute_metrics()
 
     def pause(self) -> None:
         if self.state.runtime_state != RuntimeState.STOPPED:
@@ -108,15 +179,19 @@ class TrainingEngine:
         return {"roc_auc": auc, "brier": brier, "calibration": 1.0 - brier}
 
     def _recompute_metrics(self) -> None:
-        data = self.dataset_builder._load()
+        data = self._training_dataset()
         size = int(len(data))
         self.state.dataset_size = size
         if data.empty:
             self.state.latest_metrics = {"dataset_size": 0}
             return
 
-        y_col = "persistence_outcome" if "persistence_outcome" in data.columns else "persistence"
-        positive_rate = float(data[y_col].mean())
+        y_col = next((c for c in ["persistence_label", "persistence_outcome", "persistence"] if c in data.columns), None)
+        if y_col is None:
+            self.state.latest_metrics = {"dataset_size": size, "retrain_count": self.state.retrains}
+            return
+
+        positive_rate = float(pd.to_numeric(data[y_col], errors="coerce").fillna(0).mean())
         self.state.latest_metrics = {
             "dataset_size": size,
             "positive_rate": positive_rate,
@@ -124,7 +199,7 @@ class TrainingEngine:
         }
 
     def _maybe_retrain(self) -> bool:
-        data = self.dataset_builder._load()
+        data = self._training_dataset()
         if len(data) < 100:
             return False
 
@@ -226,30 +301,43 @@ class TrainingEngine:
         }
 
     def step(self) -> StateSnapshot | None:
-        if self.state.runtime_state != RuntimeState.RUNNING or not self.tape.has_next():
+        if self.state.runtime_state != RuntimeState.RUNNING or not self.has_next():
             return None
 
         # Atomic step: exactly one observation is consumed per call.
-        observation = self.tape.next_tick()
-        future_frame = self.tape.peek_future(self.horizon_ticks)
-        future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
-        features: FeatureVector = extract_features(observation)
+        observation = self.next_tick()
+        precomputed = self._observation_has_precomputed_features(observation)
+
+        future_path: list[float] = []
+        if not precomputed and self.tape is not None:
+            future_frame = self.tape.peek_future(self.horizon_ticks)
+            future_path = future_frame["close"].tolist() if "close" in future_frame.columns else future_frame.get("price", pd.Series(dtype=float)).tolist()
+
+        if precomputed:
+            features = FeatureVector(**{col: observation[col] for col in FEATURE_COLUMNS})
+            persistence_label = int(observation.get("persistence_label", observation.get("label_persistence", 0)))
+        else:
+            features = extract_features(observation)
+            persistence_label = self._selected_label(observation, future_path)
+
         signal = self.model.predict_signal(features.__dict__) if self.state.deployed_model_path else 0.5
         trade_decision = self.policy.evaluate(probability=float(signal))
-        persistence_label = self._selected_label(observation, future_path)
 
-        self.dataset_builder.append_from_observation(
-            observation,
-            future_path,
-            label_mode=self.label_mode,
-        )
+        if not precomputed:
+            self.dataset_builder.append_from_observation(
+                observation,
+                future_path,
+                label_mode=self.label_mode,
+            )
+            self.state.dataset_size += 1
+
         self.state.observations_seen += 1
-        self.state.dataset_size += 1
 
         retrain_event = False
-        if self.state.dataset_size % self.retrain_interval == 0:
+        cadence_count = self.state.observations_seen if precomputed else self.state.dataset_size
+        if cadence_count % self.retrain_interval == 0:
             retrain_event = self._maybe_retrain()
-        if self.state.dataset_size % self.metric_interval == 0:
+        if cadence_count % self.metric_interval == 0:
             self._recompute_metrics()
 
         live_metrics = self._compute_live_metrics(trade_decision.enter, persistence_label, signal)
@@ -298,13 +386,12 @@ class TrainingEngine:
                 iterations += 1
                 continue
 
-            if not self.tape.has_next():
+            if not self.has_next():
                 time.sleep(self.poll_interval_seconds)
                 iterations += 1
                 continue
 
             self.step()
-
             iterations += 1
 
         return self.state
